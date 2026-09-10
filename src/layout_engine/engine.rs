@@ -166,6 +166,9 @@ pub struct LayoutEngine {
     persistence: PersistenceState,
     /// Set only while a master-file startup restore is waiting for the first display snapshot.
     startup_restore_pending: bool,
+    /// Workspace mode recorded in the file this engine was restored from. Runtime only;
+    /// a freshly constructed engine has nothing to disagree with.
+    restored_shared_workspaces: bool,
 }
 
 pub(crate) struct WorkspaceLayoutQuerySnapshot {
@@ -1348,6 +1351,7 @@ impl LayoutEngine {
             display_last_space: HashMap::default(),
             persistence: PersistenceState::default(),
             startup_restore_pending: false,
+            restored_shared_workspaces: virtual_workspace_config.shared_across_displays,
         }
     }
 

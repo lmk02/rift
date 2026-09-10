@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 fn legacy_schema_version() -> u32 { 0 }
 
@@ -20,6 +20,11 @@ pub(super) struct PersistedLayout {
     pub(super) space_display_map: HashMap<SpaceId, Option<String>>,
     #[serde(default)]
     pub(super) display_last_space: HashMap<String, SpaceId>,
+    /// Whether this file was written with one global workspace namespace. Per-display
+    /// files hold one set of workspaces per space with duplicated names, so the two
+    /// shapes cannot be read as each other.
+    #[serde(default)]
+    pub(super) shared_workspaces: bool,
     #[serde(flatten)]
     pub(super) persistence: PersistenceState,
 }
@@ -34,6 +39,7 @@ struct PersistedLayoutRef<'a> {
     virtual_workspace_manager: &'a WorkspaceStore,
     space_display_map: &'a HashMap<SpaceId, Option<String>>,
     display_last_space: &'a HashMap<String, SpaceId>,
+    shared_workspaces: bool,
     #[serde(flatten)]
     persistence: &'a PersistenceState,
 }
@@ -52,13 +58,15 @@ impl PersistedLayout {
             virtual_workspace_manager: &engine.virtual_workspace_manager,
             space_display_map: &engine.space_display_map,
             display_last_space: &engine.display_last_space,
+            shared_workspaces: engine.virtual_workspace_manager.shared_across_displays(),
             persistence: &engine.persistence,
         })
         .expect("persisted layout serialization must support all engine layout state")
     }
 
     pub(super) fn into_engine(self) -> LayoutEngine {
-        LayoutEngine {
+        let engine = LayoutEngine {
+            restored_shared_workspaces: self.shared_workspaces,
             workspace_layouts: self.workspace_layouts,
             floating: self.floating,
             floating_positions: self.floating_positions,
@@ -72,6 +80,7 @@ impl PersistedLayout {
             display_last_space: self.display_last_space,
             persistence: self.persistence,
             startup_restore_pending: false,
-        }
+        };
+        engine
     }
 }

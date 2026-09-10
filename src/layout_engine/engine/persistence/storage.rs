@@ -343,8 +343,38 @@ impl LayoutEngine {
         self.broadcast_tx = broadcast_tx;
         self.set_layout_settings(layout_settings);
         self.app_rules = AppRuleEngine::new(&virtual_workspace_config.app_rules);
+        if self.restored_shared_workspaces != virtual_workspace_config.shared_across_displays {
+            // The two modes describe incompatible topologies: per display it is one set of
+            // workspaces per space with names repeated, shared it is a single pool. Reading
+            // one as the other yields duplicated workspaces and meaningless global indices,
+            // so the restored topology is dropped rather than reinterpreted.
+            tracing::warn!(
+                restored_shared = self.restored_shared_workspaces,
+                configured_shared = virtual_workspace_config.shared_across_displays,
+                "shared_across_displays changed since the layout was saved;                  starting from a fresh workspace topology"
+            );
+            self.reset_workspace_topology(virtual_workspace_config, layout_settings);
+            return;
+        }
         self.virtual_workspace_manager
             .update_settings(virtual_workspace_config, layout_settings);
+    }
+
+    /// Drops every workspace-keyed store together. Leaving any of them behind would
+    /// point layout or floating state at workspaces that no longer exist.
+    fn reset_workspace_topology(
+        &mut self,
+        virtual_workspace_config: &VirtualWorkspaceSettings,
+        layout_settings: &LayoutSettings,
+    ) {
+        self.virtual_workspace_manager =
+            WorkspaceStore::new_with_config(virtual_workspace_config, layout_settings);
+        self.workspace_layouts = Default::default();
+        self.floating = FloatingManager::new();
+        self.floating_positions = Default::default();
+        self.persistence = PersistenceState::default();
+        self.startup_restore_pending = false;
+        self.restored_shared_workspaces = virtual_workspace_config.shared_across_displays;
     }
 }
 

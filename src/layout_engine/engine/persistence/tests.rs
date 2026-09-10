@@ -1082,12 +1082,12 @@ fn completed_app_discovery_discards_unmatched_startup_ghosts() {
 fn persisted_layout_schema_is_versioned_and_legacy_files_still_load() {
     let engine = test_engine();
     let serialized = engine.serialize_to_string();
-    assert!(serialized.contains("\"schema_version\":2"), "{serialized}");
+    assert!(serialized.contains("\"schema_version\":3"), "{serialized}");
 
-    let legacy = serialized.replacen("\"schema_version\":2,", "", 1);
+    let legacy = serialized.replacen("\"schema_version\":3,", "", 1);
     LayoutEngine::deserialize_from_str(&legacy).unwrap();
 
-    let future = serialized.replacen("\"schema_version\":2", "\"schema_version\":3", 1);
+    let future = serialized.replacen("\"schema_version\":3", "\"schema_version\":4", 1);
     let error = match LayoutEngine::deserialize_from_str(&future) {
         Ok(_) => panic!("future schema version should be rejected"),
         Err(error) => error,
@@ -2312,4 +2312,40 @@ fn app_close_removes_saved_fingerprints() {
 
     assert!(!engine.persistence.windows.contains_key(&window));
     assert!(!engine.persistence.pending_windows.contains(&window));
+}
+
+#[test]
+fn toggling_shared_across_displays_discards_the_incompatible_restored_topology() {
+    let mut engine = test_engine();
+    let mut window_store = WindowStore::default();
+    let space = SpaceId::new(700);
+    let _ = engine.handle_event(
+        &mut window_store,
+        LayoutEvent::SpaceExposed(space, CGSize::new(1200.0, 800.0)),
+    );
+    let serialized = engine.serialize_to_string();
+    assert!(
+        serialized.contains("\"shared_workspaces\":false"),
+        "the file has to record which mode wrote it: {serialized}"
+    );
+
+    let shared = VirtualWorkspaceSettings {
+        shared_across_displays: true,
+        ..Default::default()
+    };
+    let mut restored = LayoutEngine::deserialize_from_str(&serialized).unwrap();
+    assert!(!restored.virtual_workspace_manager().initialized_spaces().is_empty());
+
+    restored.finish_loading(&shared, &LayoutSettings::default(), None);
+
+    assert!(
+        restored.virtual_workspace_manager().initialized_spaces().is_empty(),
+        "a per-display topology must not be reinterpreted as a shared namespace"
+    );
+    assert!(restored.virtual_workspace_manager().shared_across_displays());
+
+    // Round-tripping within the same mode keeps the topology.
+    let mut same_mode = LayoutEngine::deserialize_from_str(&serialized).unwrap();
+    same_mode.finish_loading(&VirtualWorkspaceSettings::default(), &LayoutSettings::default(), None);
+    assert_eq!(same_mode.virtual_workspace_manager().initialized_spaces(), vec![space]);
 }
