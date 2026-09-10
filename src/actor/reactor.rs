@@ -1916,7 +1916,7 @@ impl Reactor {
                 {
                     match self.shared_move_window_to_workspace(workspace, *follow, *window_id) {
                         SharedWindowMove::NotApplicable => {}
-                        SharedWindowMove::Handled(result) => return result,
+                        SharedWindowMove::Handled(result) => return *result,
                         SharedWindowMove::Local { workspace: local, space } => {
                             command = layout::LayoutCommand::MoveWindowToWorkspace {
                                 workspace: crate::common::config::WorkspaceSelector::Index(local),
@@ -5174,7 +5174,7 @@ impl Reactor {
 
         if !self.is_space_active(target_space) {
             warn!(?target_space, "Move window to workspace ignored: its display is inactive");
-            return SharedWindowMove::Handled(Ok(EventOutcome::no_change()));
+            return SharedWindowMove::Handled(Box::new(Ok(EventOutcome::no_change())));
         }
         let Some(window_state) = self.state.windows.window(window) else {
             return SharedWindowMove::NotApplicable;
@@ -5212,7 +5212,7 @@ impl Reactor {
                 },
             ) {
                 Ok(switched) => outcome.absorb(switched),
-                Err(error) => return SharedWindowMove::Handled(Err(error)),
+                Err(error) => return SharedWindowMove::Handled(Box::new(Err(error))),
             }
         }
 
@@ -5231,7 +5231,7 @@ impl Reactor {
         );
         match moved {
             Ok(moved) => outcome.absorb(moved),
-            Err(error) => return SharedWindowMove::Handled(Err(error)),
+            Err(error) => return SharedWindowMove::Handled(Box::new(Err(error))),
         }
         // Two displays changed, so scoping the arrange to one of them would leave the
         // other's windows where they were.
@@ -5239,10 +5239,10 @@ impl Reactor {
         if follow {
             match self.focus_display_outcome(target_space) {
                 Ok(focus) => outcome.absorb(focus),
-                Err(error) => return SharedWindowMove::Handled(Err(error)),
+                Err(error) => return SharedWindowMove::Handled(Box::new(Err(error))),
             }
         }
-        SharedWindowMove::Handled(Ok(outcome))
+        SharedWindowMove::Handled(Box::new(Ok(outcome)))
     }
 
     /// Centers `frame` on `screen`, clamped so the window stays fully on it.
@@ -5349,6 +5349,7 @@ enum SharedWindowMove {
     /// Target is on the window's own display: run the ordinary path, but with the
     /// global index rewritten to that display's local one.
     Local { workspace: usize, space: SpaceId },
-    /// Target is on another display; already carried out.
-    Handled(anyhow::Result<EventOutcome>),
+    /// Target is on another display; already carried out. Boxed because `EventOutcome`
+    /// dwarfs the other variants.
+    Handled(Box<anyhow::Result<EventOutcome>>),
 }
