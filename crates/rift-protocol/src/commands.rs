@@ -116,6 +116,12 @@ pub enum ReactorCommand {
         selector: DisplaySelector,
         window_id: Option<u32>,
     },
+    /// Hands ownership of a workspace to another display. `workspace` is a global index;
+    /// omitted means the workspace the focused display is showing.
+    MoveWorkspaceToDisplay {
+        selector: DisplaySelector,
+        workspace: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

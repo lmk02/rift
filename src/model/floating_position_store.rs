@@ -74,6 +74,30 @@ impl FloatingPositionStore {
         locations
     }
 
+    /// Moves one workspace's stored floating frames to another space, for workspace
+    /// ownership transfers.
+    pub fn remap_workspace(
+        &mut self,
+        workspace_id: VirtualWorkspaceId,
+        old_space: SpaceId,
+        new_space: SpaceId,
+    ) {
+        if old_space == new_space {
+            return;
+        }
+        let moved: Vec<_> = self
+            .positions
+            .keys()
+            .filter(|(space, workspace, _)| *space == old_space && *workspace == workspace_id)
+            .copied()
+            .collect();
+        for key in moved {
+            if let Some(frame) = self.positions.remove(&key) {
+                self.positions.insert((new_space, key.1, key.2), frame);
+            }
+        }
+    }
+
     pub fn remap_space(&mut self, old_space: SpaceId, new_space: SpaceId) {
         if old_space == new_space {
             return;

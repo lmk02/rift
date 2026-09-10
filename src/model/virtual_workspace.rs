@@ -487,9 +487,7 @@ impl WorkspaceStore {
                     .find(|id| self.workspaces.get(*id).is_some_and(|ws| &ws.name == name)),
             };
             let space = match &assignment.display {
-                DisplaySelector::Index(index) => {
-                    visible.get(index.saturating_sub(1)).map(|(space, _)| *space)
-                }
+                DisplaySelector::Index(index) => visible.get(*index).map(|(space, _)| *space),
                 DisplaySelector::Uuid(uuid) => visible
                     .iter()
                     .find(|(_, candidate)| candidate.as_deref() == Some(uuid.as_str()))
@@ -1618,11 +1616,11 @@ mod tests {
         store.display_assignment = vec![
             WorkspaceDisplayAssignment {
                 workspace: WorkspaceSelector::Index(4),
-                display: DisplaySelector::Index(2),
+                display: DisplaySelector::Index(1),
             },
             WorkspaceDisplayAssignment {
                 workspace: WorkspaceSelector::Index(5),
-                display: DisplaySelector::Index(2),
+                display: DisplaySelector::Index(1),
             },
         ];
         let mut windows = WindowStore::default();
@@ -1673,7 +1671,7 @@ mod tests {
         let mut store = shared_store(6);
         store.display_assignment = vec![WorkspaceDisplayAssignment {
             workspace: WorkspaceSelector::Index(5),
-            display: DisplaySelector::Index(2),
+            display: DisplaySelector::Index(1),
         }];
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
@@ -1694,11 +1692,11 @@ mod tests {
         store.display_assignment = vec![
             WorkspaceDisplayAssignment {
                 workspace: WorkspaceSelector::Index(2),
-                display: DisplaySelector::Index(2),
+                display: DisplaySelector::Index(1),
             },
             WorkspaceDisplayAssignment {
                 workspace: WorkspaceSelector::Index(3),
-                display: DisplaySelector::Index(2),
+                display: DisplaySelector::Index(1),
             },
         ];
         let mut windows = WindowStore::default();

@@ -177,6 +177,23 @@ impl WorkspaceLayouts {
         }
     }
 
+    /// Moves one workspace's layout state to another space, for workspace ownership
+    /// transfers. Unlike `remap_space` this must not disturb the other workspaces on
+    /// either side.
+    pub(crate) fn remap_workspace(
+        &mut self,
+        workspace: crate::model::VirtualWorkspaceId,
+        old_space: SpaceId,
+        new_space: SpaceId,
+    ) {
+        if old_space == new_space {
+            return;
+        }
+        if let Some(info) = self.map.remove(&(old_space, workspace)) {
+            self.map.insert((new_space, workspace), info);
+        }
+    }
+
     pub(crate) fn remap_space(&mut self, old_space: SpaceId, new_space: SpaceId) {
         if old_space == new_space {
             return;

@@ -1961,6 +1961,12 @@ impl Reactor {
                 }
                 return Ok(outcome);
             }
+            Event::Command(Command::Reactor(ReactorCommand::MoveWorkspaceToDisplay {
+                selector,
+                workspace,
+            })) => {
+                return self.move_workspace_to_display(&selector, workspace);
+            }
             Event::Command(Command::Reactor(ReactorCommand::MoveWindowToDisplay {
                 selector,
                 window_id,
@@ -4950,6 +4956,103 @@ impl Reactor {
                 focus_window_center,
             },
         )
+    }
+
+    /// Hands a workspace, and the windows in it, to another display.
+    fn move_workspace_to_display(
+        &mut self,
+        selector: &crate::common::config::DisplaySelector,
+        workspace: Option<usize>,
+    ) -> anyhow::Result<EventOutcome> {
+        if self.is_in_drag() {
+            warn!("Ignoring move-workspace-to-display while a drag is active");
+            return Ok(EventOutcome::no_change());
+        }
+        let Some(command_space) = self.command_context_space() else {
+            return Ok(EventOutcome::no_change());
+        };
+        let workspaces = self.layout_manager.layout_engine.virtual_workspace_manager();
+        let target_workspace = match workspace {
+            Some(index) => workspaces.workspace_at_global_index(index).map(|(id, _)| id),
+            None => workspaces.active_workspace(command_space),
+        };
+        let Some(target_workspace) = target_workspace else {
+            warn!(?workspace, "Move workspace to display ignored: workspace not found");
+            return Ok(EventOutcome::no_change());
+        };
+        let Some(source_space) = workspaces.workspace_space(target_workspace) else {
+            return Ok(EventOutcome::no_change());
+        };
+
+        let origin = self
+            .space_state
+            .screen_by_space(source_space)
+            .map(|screen| screen.frame.mid())
+            .or_else(|| self.current_screen_center());
+        let Some(target_screen) = self.screen_for_selector(selector, origin).cloned() else {
+            warn!(?selector, "Move workspace to display ignored: target display not found");
+            return Ok(EventOutcome::no_change());
+        };
+        let Some(target_space) = target_screen.space.filter(|space| self.is_space_active(*space))
+        else {
+            warn!(?selector, "Move workspace to display ignored: target space unavailable");
+            return Ok(EventOutcome::no_change());
+        };
+        if target_space == source_space {
+            return Ok(EventOutcome::no_change());
+        }
+
+        let windows = self.layout_manager.layout_engine.move_workspace_to_space(
+            &mut self.state.windows,
+            target_workspace,
+            target_space,
+            target_screen.frame.size,
+        );
+
+        let mut outcome = EventOutcome::layout_changed(false).with_arrange_space_scope(None);
+        for window in windows {
+            let Some(state) = self.state.windows.window(window) else {
+                continue;
+            };
+            let window_server_id = state.info.sys_id;
+            // Writing the frame onto the target screen is what actually makes macOS
+            // reparent the window; the arrange pass then lays it out properly.
+            let frame = Self::centered_frame_on_screen(state.frame_monotonic, target_screen.frame);
+            if let Some(window_state) = self.state.windows.window_mut(window) {
+                window_state.frame_monotonic = frame;
+            }
+            if let Some(window_server_id) = window_server_id {
+                self.state.windows.set_window_server_space(window_server_id, Some(target_space));
+                self.state.windows.mark_window_visible(window_server_id);
+            }
+            outcome = outcome.with_pre_layout_window_frame_write(window, frame, true);
+        }
+
+        // Show what was just moved, rather than leaving it parked behind whatever the
+        // target display happened to be on.
+        if let Some(local) = self
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .local_index_of(target_space, target_workspace)
+        {
+            let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(false);
+            outcome.absorb(command_workflow::handle_command_layout(
+                &mut self.state,
+                &mut self.layout_manager,
+                &mut self.workspace_switch_manager,
+                command_workflow::LayoutCommandPayload {
+                    command: layout::LayoutCommand::SwitchToWorkspace(local),
+                    command_space: Some(target_space),
+                    visible_spaces,
+                    visible_space_centers,
+                    post_arrange_mouse_warp: None,
+                },
+            )?);
+        }
+        outcome = outcome.with_arrange_space_scope(None);
+        outcome.absorb(self.focus_display_outcome(target_space)?);
+        Ok(outcome)
     }
 
     /// Sends a window to a workspace owned by another display, in shared mode.

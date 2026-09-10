@@ -440,6 +440,21 @@ enum DisplayCommands {
         /// Display UUID
         uuid: String,
     },
+    /// Move a workspace, and its windows, to a display by direction, index, or UUID.
+    MoveWorkspace {
+        /// Direction relative to the workspace's current display (left, right, up, down).
+        #[arg(long)]
+        direction: Option<String>,
+        /// Display index (0-based).
+        #[arg(long)]
+        index: Option<usize>,
+        /// Display UUID.
+        #[arg(long)]
+        uuid: Option<String>,
+        /// Optional workspace index; defaults to the active workspace if omitted.
+        #[arg(long)]
+        workspace: Option<usize>,
+    },
     /// Move a window to a display by direction, index, or UUID.
     MoveWindow {
         /// Direction relative to the window's current display (left, right, up, down).
@@ -1065,6 +1080,17 @@ fn map_display_command(cmd: DisplayCommands) -> Result<CliCommand, String> {
                 reactor::ReactorCommand::MoveMouseToDisplay(DisplaySelector::Uuid(uuid)),
             )))
         }
+        DisplayCommands::MoveWorkspace {
+            direction,
+            index,
+            uuid,
+            workspace,
+        } => Ok(CliCommand::Reactor(reactor::Command::Reactor(
+            reactor::ReactorCommand::MoveWorkspaceToDisplay {
+                selector: build_display_selector(direction, index, uuid)?,
+                workspace,
+            },
+        ))),
         DisplayCommands::MoveWindow {
             direction,
             index,

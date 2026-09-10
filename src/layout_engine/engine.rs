@@ -1272,6 +1272,50 @@ impl LayoutEngine {
         }
     }
 
+    /// Transfers ownership of one workspace to another display.
+    ///
+    /// Every store that keys on `SpaceId` has to move together, or the workspace's windows
+    /// stop resolving through `workspace_windows` and end up in neither display's arrange
+    /// pass — parked offscreen forever. Returns the member windows so the caller can write
+    /// them onto the new screen.
+    pub fn move_workspace_to_space(
+        &mut self,
+        window_store: &mut WindowStore,
+        workspace_id: crate::model::VirtualWorkspaceId,
+        new_space: SpaceId,
+        new_screen_size: CGSize,
+    ) -> Vec<WindowId> {
+        let Some(old_space) = self.virtual_workspace_manager.workspace_space(workspace_id) else {
+            return Vec::new();
+        };
+        if old_space == new_space {
+            return Vec::new();
+        }
+
+        let windows =
+            self.virtual_workspace_manager.relocate_workspace(window_store, workspace_id, new_space);
+        self.workspace_layouts.remap_workspace(workspace_id, old_space, new_space);
+        self.floating_positions.remap_workspace(workspace_id, old_space, new_space);
+
+        let tree = &mut self.virtual_workspace_manager.workspaces[workspace_id].layout_system;
+        self.workspace_layouts.ensure_active_for_workspace(
+            new_space,
+            new_screen_size,
+            workspace_id,
+            tree,
+        );
+
+        // `FloatingManager` tracks only the active workspace per space, so both sides are
+        // rebuilt rather than remapped.
+        self.update_active_floating_windows(window_store, old_space);
+        self.update_active_floating_windows(window_store, new_space);
+        self.broadcast_workspace_changed(new_space);
+        self.broadcast_windows_changed(window_store, old_space);
+        self.broadcast_windows_changed(window_store, new_space);
+
+        windows
+    }
+
     pub fn prune_display_state(&mut self, active_display_uuids: &[String]) {
         let active: HashSet<&str> = active_display_uuids.iter().map(|s| s.as_str()).collect();
 

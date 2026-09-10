@@ -75,7 +75,7 @@ pub struct WorkspaceLayoutRule {
 pub struct WorkspaceDisplayAssignment {
     /// Target workspace by global index or name
     pub workspace: WorkspaceSelector,
-    /// Display by 1-based index in physical order, or by display UUID
+    /// Display by index in physical order (0-based, left to right), or by UUID
     pub display: DisplaySelector,
 }
 
@@ -1693,6 +1693,42 @@ mod tests {
         let settings: VirtualWorkspaceSettings =
             toml::from_str("prevent_wrapping_around = true").unwrap();
         assert!(settings.prevent_wrapping);
+    }
+
+    #[test]
+    fn move_workspace_to_display_binds_as_a_key_command() {
+        #[derive(Deserialize)]
+        struct TestConfig {
+            keys: HashMap<String, WmCommand>,
+        }
+
+        let config: TestConfig = toml::from_str(
+            r#"
+            [keys]
+            to_the_right = { move_workspace_to_display = { selector = "right" } }
+            pinned = { move_workspace_to_display = { selector = 1, workspace = 7 } }
+            "#,
+        )
+        .expect("keybinding should parse");
+
+        assert_eq!(
+            config.keys["to_the_right"],
+            WmCommand::ReactorCommand(reactor::Command::Reactor(
+                reactor::ReactorCommand::MoveWorkspaceToDisplay {
+                    selector: DisplaySelector::Direction(crate::layout_engine::Direction::Right),
+                    workspace: None,
+                }
+            ))
+        );
+        assert_eq!(
+            config.keys["pinned"],
+            WmCommand::ReactorCommand(reactor::Command::Reactor(
+                reactor::ReactorCommand::MoveWorkspaceToDisplay {
+                    selector: DisplaySelector::Index(1),
+                    workspace: Some(7),
+                }
+            ))
+        );
     }
 
     #[test]

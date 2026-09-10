@@ -5632,7 +5632,7 @@ fn shared_workspace_settings(
         workspace_display_assignment: (first_on_right..count)
             .map(|index| crate::common::config::WorkspaceDisplayAssignment {
                 workspace: WorkspaceSelector::Index(index),
-                display: crate::common::config::DisplaySelector::Index(2),
+                display: crate::common::config::DisplaySelector::Index(1),
             })
             .collect(),
         ..Default::default()
@@ -6004,5 +6004,64 @@ fn move_window_to_a_workspace_on_the_same_display_is_unchanged_by_shared_mode() 
             .windows
             .workspace_windows(right_space, target)
             .is_empty()
+    );
+}
+
+#[test]
+fn moving_a_workspace_to_another_display_takes_its_windows_with_it() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let window = seed_window_on_left(&mut reactor, left_space);
+    let workspace = reactor.layout_manager.layout_engine.active_workspace(left_space).unwrap();
+    let global_index = reactor
+        .layout_manager
+        .layout_engine
+        .virtual_workspace_manager()
+        .global_index_of(workspace)
+        .unwrap();
+
+    let outcome = reactor
+        .dispatch_workflow(Event::Command(crate::model::reactor::Command::Reactor(
+            crate::model::reactor::ReactorCommand::MoveWorkspaceToDisplay {
+                selector: DisplaySelector::Index(1),
+                workspace: None,
+            },
+        )))
+        .expect("move workspace to display should dispatch");
+
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_space(workspace),
+        Some(right_space),
+        "the workspace changes owner"
+    );
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .global_index_of(workspace),
+        Some(global_index),
+        "and keeps its global number, so the keybind still reaches it"
+    );
+    assert_eq!(
+        reactor.state.windows.workspace_windows(right_space, workspace),
+        vec![window],
+        "its windows must resolve under the new space or they arrange nowhere"
+    );
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(right_space),
+        Some(workspace),
+        "the moved workspace is shown rather than parked behind the old one"
+    );
+    assert!(
+        outcome.pre_layout_window_frame_writes.iter().any(|write| write.window == window),
+        "the window has to be written onto the new screen for macOS to reparent it"
+    );
+    assert!(
+        reactor.layout_manager.layout_engine.active_workspace(left_space).is_some(),
+        "the display it left must still be showing something"
     );
 }

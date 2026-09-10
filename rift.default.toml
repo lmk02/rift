@@ -291,10 +291,10 @@ workspace_rules = []
 # listed start on the first display. This is what makes a split like "1-5 left, 6-10 right"
 # survive a fresh install or a display being replugged.
 # - workspace: global workspace index (0-based) or name
-# - display: 1-based index in physical order (left to right), or a display UUID string
+# - display: display index in physical order, 0-based left to right, or a display UUID string
 # workspace_display_assignment = [
-#   { workspace = 5, display = 2 },
-#   { workspace = 6, display = 2 },
+#   { workspace = 5, display = 1 },
+#   { workspace = 6, display = 1 },
 # ]
 workspace_display_assignment = []
 
@@ -432,8 +432,9 @@ comb1 = "Alt + Shift"
 # - swap_windows = [123, 456]
 # - exec = "command" | exec = ["cmd", "arg1", "..."]
 # - move_mouse_to_display = "left"|"right"|"up"|"down"|N|"<display_uuid>"
-# - move_workspace_to_display = "left"|"right"|"up"|"down"|N|"<display_uuid>"
-# - move_workspace_to_display = { selector = ..., workspace = N } (workspace is optional)
+# - move_workspace_to_display = { selector = "left"|"right"|"up"|"down"|N|"<display_uuid>" }
+# - move_workspace_to_display = { selector = ..., workspace = N }
+#   (shared_across_displays only; workspace is a global index, defaults to the active one)
 # - move_window_to_display = { selector = "left"|"right"|"up"|"down"|N|"<display_uuid>", window_id = 123 }
 # - close_window / close_window = { window_server_id = 123 } (optional window id)
 # - focus_window = { window_id = 123, window_server_id = 456 }
