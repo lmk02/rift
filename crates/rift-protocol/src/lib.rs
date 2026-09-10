@@ -21,5 +21,7 @@ pub use queries::{
     ApplicationData, ContainerNodeType, ContainerTreeNode, DisplayData, LayoutStateData, Point,
     Rect, Size, WindowData, WindowId, WindowLayoutPosition, WorkspaceData, WorkspaceLayoutData,
 };
-pub use selectors::{DisplaySelector, RestoreScope, RestoreSource, WorkspaceSelector};
+pub use selectors::{
+    DisplayCycle, DisplaySelector, RestoreScope, RestoreSource, WorkspaceSelector,
+};
 pub use transport::{JsonRiftResponse, RiftRequest, RiftResponse};

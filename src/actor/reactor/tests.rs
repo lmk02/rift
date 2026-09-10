@@ -5,7 +5,7 @@ use super::testing::*;
 use super::*;
 use crate::actor::app::{AppThreadHandle, Request, pid_t};
 use crate::actor::wm_controller::WmEvent;
-use crate::common::config::{LayoutMode, OuterGaps, WorkspaceSelector};
+use crate::common::config::{DisplayCycle, LayoutMode, OuterGaps, WorkspaceSelector};
 use crate::layout_engine::{Direction, LayoutCommand, LayoutEvent};
 use crate::model::window_store::NativeFullscreenTransition;
 use crate::sys::app::{AppInfo, WindowInfo};
@@ -6135,5 +6135,126 @@ fn set_workspace_layout_targets_the_global_index_in_shared_mode() {
             .map(|workspace| workspace.layout_mode()),
         Some(crate::common::config::LayoutMode::Bsp),
         "workspace 8 means the ninth workspace in the namespace, on whichever display owns it"
+    );
+}
+
+#[test]
+fn cycling_display_selector_wraps_at_both_ends() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let window = seed_window_on_left(&mut reactor, left_space);
+    let workspace = reactor.layout_manager.layout_engine.active_workspace(left_space).unwrap();
+
+    // A direction stops at the edge; "next" keeps going and wraps.
+    let cycle = |reactor: &mut Reactor, selector: DisplaySelector| {
+        reactor
+            .dispatch_workflow(Event::Command(crate::model::reactor::Command::Reactor(
+                crate::model::reactor::ReactorCommand::MoveWorkspaceToDisplay {
+                    selector,
+                    workspace: None,
+                },
+            )))
+            .expect("move workspace to display should dispatch")
+    };
+
+    cycle(&mut reactor, DisplaySelector::Cycle(DisplayCycle::Next));
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_space(workspace),
+        Some(right_space)
+    );
+
+    // From the rightmost display, `right` has no target at all.
+    reactor.handle_event(Event::ActiveDisplayChanged {
+        menu_bar_space: Some(right_space),
+        command_space: Some(right_space),
+    });
+    cycle(&mut reactor, DisplaySelector::Direction(Direction::Right));
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_space(workspace),
+        Some(right_space),
+        "a direction must not wrap"
+    );
+
+    // ...but `next` wraps back round to the first display.
+    cycle(&mut reactor, DisplaySelector::Cycle(DisplayCycle::Next));
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_space(workspace),
+        Some(left_space),
+        "next wraps from the last display back to the first"
+    );
+    assert_eq!(
+        reactor.state.windows.workspace_windows(left_space, workspace),
+        vec![window]
+    );
+}
+
+#[test]
+fn cycling_display_selector_also_wraps_for_window_moves_and_focus() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let window = seed_window_on_left(&mut reactor, left_space);
+
+    let move_window = |reactor: &mut Reactor, selector: DisplaySelector| {
+        reactor
+            .dispatch_workflow(Event::Command(crate::model::reactor::Command::Reactor(
+                crate::model::reactor::ReactorCommand::MoveWindowToDisplay {
+                    selector,
+                    // Named explicitly: outside tests this command falls back to the
+                    // frontmost window, which the harness does not set.
+                    window_id: Some(window.idx.get()),
+                },
+            )))
+            .expect("move window to display should dispatch")
+    };
+
+    move_window(&mut reactor, DisplaySelector::Cycle(DisplayCycle::Next));
+    assert_eq!(
+        reactor.state.windows.workspace_info_for_window(window).map(|info| info.space),
+        Some(right_space)
+    );
+
+    // Back from the rightmost display: a direction has nowhere to go, `next` wraps.
+    reactor.handle_event(Event::ActiveDisplayChanged {
+        menu_bar_space: Some(right_space),
+        command_space: Some(right_space),
+    });
+    move_window(&mut reactor, DisplaySelector::Direction(Direction::Right));
+    assert_eq!(
+        reactor.state.windows.workspace_info_for_window(window).map(|info| info.space),
+        Some(right_space),
+        "a direction must not wrap"
+    );
+
+    move_window(&mut reactor, DisplaySelector::Cycle(DisplayCycle::Next));
+    assert_eq!(
+        reactor.state.windows.workspace_info_for_window(window).map(|info| info.space),
+        Some(left_space),
+        "next wraps from the last display back to the first"
+    );
+
+    // Focus resolves the same selector, so it wraps too.
+    let outcome = reactor
+        .dispatch_workflow(Event::Command(crate::model::reactor::Command::Reactor(
+            crate::model::reactor::ReactorCommand::FocusDisplay(DisplaySelector::Cycle(
+                DisplayCycle::Next,
+            )),
+        )))
+        .expect("focus display should dispatch");
+    // Still standing on the right display, so `next` wraps focus onto the left one.
+    let left_screen = reactor.space_state.screen_by_space(left_space).unwrap().frame;
+    assert!(
+        outcome.mouse_warps.iter().any(|point| left_screen.contains(*point)),
+        "focus should have cycled round onto the first display, got {:?}",
+        outcome.mouse_warps
     );
 }

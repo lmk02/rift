@@ -4874,6 +4874,22 @@ impl Reactor {
                 let origin = origin_override.or_else(|| self.current_screen_center())?;
                 self.screen_for_direction_from_point(origin, *direction)
             }
+            DisplaySelector::Cycle(cycle) => {
+                let screens = self.screens_in_physical_order();
+                if screens.is_empty() {
+                    return None;
+                }
+                let origin = origin_override.or_else(|| self.current_screen_center())?;
+                let current = screens
+                    .iter()
+                    .position(|screen| screen.frame.contains(origin))
+                    .unwrap_or(0);
+                let offset = match cycle {
+                    crate::common::config::DisplayCycle::Next => 1,
+                    crate::common::config::DisplayCycle::Prev => screens.len() - 1,
+                };
+                screens.get((current + offset) % screens.len()).copied()
+            }
             DisplaySelector::Index(index) => self.screens_in_physical_order().get(*index).copied(),
             DisplaySelector::Uuid(uuid) => {
                 self.space_state.screens.iter().find(|screen| screen.display_uuid == *uuid)

@@ -4,7 +4,8 @@ use std::str::FromStr;
 use anyhow::bail;
 use regex::RegexBuilder;
 pub use rift_protocol::{
-    AnimationEasing, ConfigCommand, DisplaySelector, LayoutMode, WorkspaceSelector,
+    AnimationEasing, ConfigCommand, DisplayCycle, DisplaySelector, LayoutMode,
+    WorkspaceSelector,
 };
 use serde::{Deserialize, Serialize};
 

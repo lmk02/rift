@@ -1119,6 +1119,13 @@ fn build_display_selector(
     }
 
     if let Some(direction) = direction {
+        // `next`/`prev` cycle through the displays and wrap; the four compass directions
+        // stop at the edge.
+        match direction.trim().to_ascii_lowercase().as_str() {
+            "next" => return Ok(DisplaySelector::Cycle(rift_protocol::DisplayCycle::Next)),
+            "prev" => return Ok(DisplaySelector::Cycle(rift_protocol::DisplayCycle::Prev)),
+            _ => {}
+        }
         let parsed_direction = parse_focus_direction(&direction)?;
         Ok(DisplaySelector::Direction(parsed_direction))
     } else if let Some(index) = index {

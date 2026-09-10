@@ -492,8 +492,8 @@ impl WorkspaceStore {
                     .iter()
                     .find(|(_, candidate)| candidate.as_deref() == Some(uuid.as_str()))
                     .map(|(space, _)| *space),
-                // Rejected by config validation; a direction has no stable owner.
-                DisplaySelector::Direction(_) => None,
+                // Rejected by config validation; neither names a stable owner.
+                DisplaySelector::Direction(_) | DisplaySelector::Cycle(_) => None,
             };
             if let (Some(workspace), Some(space)) = (workspace, space) {
                 self.relocate_workspace(window_store, workspace, space);
