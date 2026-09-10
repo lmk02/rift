@@ -1906,18 +1906,46 @@ impl Reactor {
             Event::Command(Command::Layout(mut command)) => {
                 let post_arrange_mouse_warp =
                     self.config.settings.mouse_follows_focus.then(|| self.main_window()).flatten();
+                let mut command_space = self.command_context_space();
+                let mut focus_display_space = None;
                 if let layout::LayoutCommand::MoveWindowToWorkspace {
                     workspace,
                     follow,
                     window_id,
                 } = &command
-                    && let Some(result) =
-                        self.shared_move_window_to_workspace(workspace, *follow, *window_id)
                 {
-                    return result;
+                    match self.shared_move_window_to_workspace(workspace, *follow, *window_id) {
+                        SharedWindowMove::NotApplicable => {}
+                        SharedWindowMove::Handled(result) => return result,
+                        SharedWindowMove::Local { workspace: local, space } => {
+                            command = layout::LayoutCommand::MoveWindowToWorkspace {
+                                workspace: crate::common::config::WorkspaceSelector::Index(local),
+                                follow: *follow,
+                                window_id: *window_id,
+                            };
+                            command_space = Some(space);
+                        }
+                    }
                 }
-                let mut command_space = self.command_context_space();
-                let mut focus_display_space = None;
+                if let layout::LayoutCommand::SetWorkspaceLayout {
+                    workspace: Some(index),
+                    mode,
+                } = &command
+                    && self.config.virtual_workspaces.shared_across_displays
+                {
+                    // Same rewrite as a window move, and for the same reason: the engine
+                    // indexes into one display's workspace list.
+                    let workspaces = self.layout_manager.layout_engine.virtual_workspace_manager();
+                    if let Some((target, space)) = workspaces.workspace_at_global_index(*index)
+                        && let Some(local) = workspaces.local_index_of(space, target)
+                    {
+                        command = layout::LayoutCommand::SetWorkspaceLayout {
+                            workspace: Some(local),
+                            mode: *mode,
+                        };
+                        command_space = Some(space);
+                    }
+                }
                 match self.resolve_shared_workspace_command(&command, command_space) {
                     SharedRetarget::Unchanged => {}
                     SharedRetarget::FocusOnly { space } => {
@@ -5055,28 +5083,22 @@ impl Reactor {
         Ok(outcome)
     }
 
-    /// Sends a window to a workspace owned by another display, in shared mode.
+    /// Resolves the target of `move_window_to_workspace` against the global namespace.
     ///
-    /// Returns `None` when this does not apply — shared mode off, unresolvable, or the
-    /// target workspace is on the window's own display — so the caller runs the ordinary
-    /// same-display path.
-    fn shared_move_window_to_workspace(
+    /// Returns the window, where it currently lives, and the workspace it should end up
+    /// in together with that workspace's owning display.
+    fn resolve_shared_window_move(
         &mut self,
         selector: &crate::common::config::WorkspaceSelector,
-        follow: bool,
         window_index: Option<u32>,
-    ) -> Option<anyhow::Result<EventOutcome>> {
-        if !self.config.virtual_workspaces.shared_across_displays || self.is_in_drag() {
-            return None;
-        }
+    ) -> Option<(WindowId, SpaceId, crate::model::VirtualWorkspaceId, SpaceId)> {
         let command_space = self.command_context_space()?;
         let window = match window_index {
             Some(index) => {
                 let workspaces = self.layout_manager.layout_engine.virtual_workspace_manager();
-                self.iter_active_spaces()
-                    .find_map(|space| {
-                        workspaces.find_window_by_idx(&self.state.windows, space, index)
-                    })?
+                self.iter_active_spaces().find_map(|space| {
+                    workspaces.find_window_by_idx(&self.state.windows, space, index)
+                })?
             }
             // Mirrors the same-display path, which operates on the layout engine's
             // focused window.
@@ -5087,9 +5109,6 @@ impl Reactor {
                 .or_else(|| self.main_window())
                 .or_else(|| self.window_id_under_cursor())?,
         };
-        let window_state = self.state.windows.window(window)?;
-        let window_server_id = window_state.info.sys_id;
-        let window_frame = window_state.frame_monotonic;
         let source_space = self
             .assigned_space_for_window_id(window)
             .or_else(|| self.best_space_for_window_id(window))
@@ -5099,16 +5118,14 @@ impl Reactor {
         let workspaces = self.layout_manager.layout_engine.virtual_workspace_manager();
         let current = workspaces.workspace_for_window(&self.state.windows, source_space, window);
         let (target_workspace, target_space) = match selector {
-            crate::common::config::WorkspaceSelector::Index(index) => workspaces.workspace_at_global_index(*index)?,
-            crate::common::config::WorkspaceSelector::Name(name) if name == "next" || name == "prev" => {
-                let direction =
-                    if name == "next" { Direction::Right } else { Direction::Left };
-                workspaces.step_workspace_global(
-                    &self.state.windows,
-                    current?,
-                    None,
-                    direction,
-                )?
+            crate::common::config::WorkspaceSelector::Index(index) => {
+                workspaces.workspace_at_global_index(*index)?
+            }
+            crate::common::config::WorkspaceSelector::Name(name)
+                if name == "next" || name == "prev" =>
+            {
+                let direction = if name == "next" { Direction::Right } else { Direction::Left };
+                workspaces.step_workspace_global(&self.state.windows, current?, None, direction)?
             }
             crate::common::config::WorkspaceSelector::Name(name) => workspaces
                 .global_workspace_order()
@@ -5117,24 +5134,70 @@ impl Reactor {
                     workspaces.workspace_info(*space, *id).is_some_and(|ws| &ws.name == name)
                 })?,
         };
-        if target_space == source_space {
-            return None;
+        Some((window, source_space, target_workspace, target_space))
+    }
+
+    /// Resolves `move_window_to_workspace` against the global namespace.
+    ///
+    /// A target on another display is carried out here. A target on the window's own
+    /// display is only rewritten, because the engine indexes into that display's own
+    /// workspace list and so needs a display-local index rather than a global one.
+    fn shared_move_window_to_workspace(
+        &mut self,
+        selector: &crate::common::config::WorkspaceSelector,
+        follow: bool,
+        window_index: Option<u32>,
+    ) -> SharedWindowMove {
+        if !self.config.virtual_workspaces.shared_across_displays || self.is_in_drag() {
+            return SharedWindowMove::NotApplicable;
         }
+        let Some((window, source_space, target_workspace, target_space)) =
+            self.resolve_shared_window_move(selector, window_index)
+        else {
+            return SharedWindowMove::NotApplicable;
+        };
+
+        if target_space == source_space {
+            let Some(local) = self
+                .layout_manager
+                .layout_engine
+                .virtual_workspace_manager()
+                .local_index_of(source_space, target_workspace)
+            else {
+                return SharedWindowMove::NotApplicable;
+            };
+            return SharedWindowMove::Local {
+                workspace: local,
+                space: source_space,
+            };
+        }
+
         if !self.is_space_active(target_space) {
             warn!(?target_space, "Move window to workspace ignored: its display is inactive");
-            return Some(Ok(EventOutcome::no_change()));
+            return SharedWindowMove::Handled(Ok(EventOutcome::no_change()));
         }
-        let target_screen = self.space_state.screen_by_space(target_space)?.frame;
+        let Some(window_state) = self.state.windows.window(window) else {
+            return SharedWindowMove::NotApplicable;
+        };
+        let window_server_id = window_state.info.sys_id;
+        let window_frame = window_state.frame_monotonic;
+        let Some(target_screen) = self.space_state.screen_by_space(target_space).map(|s| s.frame)
+        else {
+            return SharedWindowMove::NotApplicable;
+        };
 
         let mut outcome = EventOutcome::no_change();
         if follow {
             // Activate first so the window lands in a workspace that is on screen, which
             // is what makes the subsequent focus meaningful.
-            let local = self
+            let Some(local) = self
                 .layout_manager
                 .layout_engine
                 .virtual_workspace_manager()
-                .local_index_of(target_space, target_workspace)?;
+                .local_index_of(target_space, target_workspace)
+            else {
+                return SharedWindowMove::NotApplicable;
+            };
             let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(false);
             match command_workflow::handle_command_layout(
                 &mut self.state,
@@ -5149,7 +5212,7 @@ impl Reactor {
                 },
             ) {
                 Ok(switched) => outcome.absorb(switched),
-                Err(error) => return Some(Err(error)),
+                Err(error) => return SharedWindowMove::Handled(Err(error)),
             }
         }
 
@@ -5168,7 +5231,7 @@ impl Reactor {
         );
         match moved {
             Ok(moved) => outcome.absorb(moved),
-            Err(error) => return Some(Err(error)),
+            Err(error) => return SharedWindowMove::Handled(Err(error)),
         }
         // Two displays changed, so scoping the arrange to one of them would leave the
         // other's windows where they were.
@@ -5176,10 +5239,10 @@ impl Reactor {
         if follow {
             match self.focus_display_outcome(target_space) {
                 Ok(focus) => outcome.absorb(focus),
-                Err(error) => return Some(Err(error)),
+                Err(error) => return SharedWindowMove::Handled(Err(error)),
             }
         }
-        Some(Ok(outcome))
+        SharedWindowMove::Handled(Ok(outcome))
     }
 
     /// Centers `frame` on `screen`, clamped so the window stays fully on it.
@@ -5277,4 +5340,15 @@ enum SharedRetarget {
     },
     /// The target workspace is already active on another display; only focus must move.
     FocusOnly { space: SpaceId },
+}
+
+/// Resolution of `move_window_to_workspace` in shared-across-displays mode.
+enum SharedWindowMove {
+    /// Shared mode off, or nothing resolved; run the ordinary path untouched.
+    NotApplicable,
+    /// Target is on the window's own display: run the ordinary path, but with the
+    /// global index rewritten to that display's local one.
+    Local { workspace: usize, space: SpaceId },
+    /// Target is on another display; already carried out.
+    Handled(anyhow::Result<EventOutcome>),
 }

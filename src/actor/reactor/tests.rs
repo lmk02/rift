@@ -6065,3 +6065,75 @@ fn moving_a_workspace_to_another_display_takes_its_windows_with_it() {
         "the display it left must still be showing something"
     );
 }
+
+#[test]
+fn move_window_between_two_workspaces_on_the_same_non_first_display() {
+    // The reported bug: standing on the second display, sending a window from workspace 5
+    // to 6..9 did nothing, because the global index was handed to an engine that indexes
+    // into that display's own five-entry list. Going via the first display worked, since
+    // that took the cross-display path instead.
+    for global_index in 6..10 {
+        let (mut reactor, _left_space, right_space) = shared_two_display_reactor(10, 5);
+        reactor.handle_event(Event::ActiveDisplayChanged {
+            menu_bar_space: Some(right_space),
+            command_space: Some(right_space),
+        });
+
+        let window = WindowId::new(1, 1);
+        reactor.add_test_app(1);
+        reactor.add_test_window(
+            window,
+            WindowServerId::new(101),
+            Some(right_space),
+            CGRect::new(CGPoint::new(1100., 100.), CGSize::new(300., 200.)),
+        );
+        let (source, owner) = global_workspace(&reactor, 5);
+        assert_eq!(owner, right_space);
+        assert!(reactor.assign_test_window_to_workspace(right_space, window, source));
+        reactor.send_layout_event(LayoutEvent::WindowAdded(right_space, window));
+        reactor.send_layout_event(LayoutEvent::WindowFocused(right_space, window));
+
+        let (target, owner) = global_workspace(&reactor, global_index);
+        assert_eq!(owner, right_space);
+
+        reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+            workspace: WorkspaceSelector::Index(global_index),
+            follow: false,
+            window_id: None,
+        });
+
+        let assignment = reactor
+            .state
+            .windows
+            .workspace_info_for_window(window)
+            .expect("the window keeps an assignment");
+        assert_eq!(assignment.space, right_space);
+        assert_eq!(
+            assignment.workspace_id, target,
+            "global index {global_index} must reach that workspace from its own display"
+        );
+    }
+}
+
+#[test]
+fn set_workspace_layout_targets_the_global_index_in_shared_mode() {
+    let (mut reactor, _left_space, right_space) = shared_two_display_reactor(10, 5);
+    let (target, owner) = global_workspace(&reactor, 8);
+    assert_eq!(owner, right_space);
+
+    reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
+        workspace: Some(8),
+        mode: crate::common::config::LayoutMode::Bsp,
+    });
+
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_info(right_space, target)
+            .map(|workspace| workspace.layout_mode()),
+        Some(crate::common::config::LayoutMode::Bsp),
+        "workspace 8 means the ninth workspace in the namespace, on whichever display owns it"
+    );
+}
