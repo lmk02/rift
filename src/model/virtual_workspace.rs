@@ -1329,13 +1329,47 @@ impl WorkspaceStore {
         existing: Option<WindowWorkspaceInfo>,
         preserve_existing: bool,
     ) -> Result<VirtualWorkspaceId, WorkspaceError> {
+        let shared = self.shared_across_displays;
         let selected = selector.and_then(|selector| {
-            let workspaces = self.list_workspaces(space);
-            match selector {
-                WorkspaceSelector::Index(index) => workspaces.get(*index).map(|(id, _)| *id),
-                WorkspaceSelector::Name(name) => {
-                    workspaces.iter().find(|(_, candidate)| candidate == name).map(|(id, _)| *id)
+            let resolved = if shared {
+                // One namespace, so a rule index means the same workspace everywhere.
+                match selector {
+                    WorkspaceSelector::Index(index) => self.workspace_at_global_index(*index),
+                    WorkspaceSelector::Name(name) => {
+                        self.global_workspace_order().into_iter().find(|(id, _)| {
+                            self.workspaces.get(*id).is_some_and(|ws| &ws.name == name)
+                        })
+                    }
                 }
+            } else {
+                let workspaces = self.list_workspaces(space);
+                match selector {
+                    WorkspaceSelector::Index(index) => {
+                        workspaces.get(*index).map(|(id, _)| (*id, space))
+                    }
+                    WorkspaceSelector::Name(name) => workspaces
+                        .iter()
+                        .find(|(_, candidate)| candidate == name)
+                        .map(|(id, _)| (*id, space)),
+                }
+            };
+            match resolved {
+                // ponytail: a rule can name a workspace owned by another display, but the
+                // window is already on this one and assigning it across spaces here would
+                // leave it parked offscreen on a display it was never moved to. Falls back
+                // to this display. Upgrade path: route through the cross-display move
+                // (`LayoutEngine::move_window_to_space` plus the frame write) once app
+                // rules run somewhere that can issue an EventOutcome.
+                Some((_, owner)) if owner != space => {
+                    warn!(
+                        ?space,
+                        ?owner,
+                        ?selector,
+                        "App rule targets a workspace on another display; using this display instead"
+                    );
+                    None
+                }
+                other => other.map(|(id, _)| id),
             }
         });
         if selector.is_some() && selected.is_none() {
@@ -1739,6 +1773,36 @@ mod tests {
             Some(ids[0])
         );
         assert_eq!(store.prev_workspace(&windows, space, ids[0], None), ids.last().copied());
+    }
+
+    #[test]
+    fn app_rules_resolve_workspace_indices_globally_in_shared_mode() {
+        let mut store = shared_store(6);
+        store.display_assignment = vec![WorkspaceDisplayAssignment {
+            workspace: WorkspaceSelector::Index(5),
+            display: DisplaySelector::Index(1),
+        }];
+        let mut windows = WindowStore::default();
+        let left = SpaceId::new(1);
+        let right = SpaceId::new(2);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+        let (third, owner) = store.workspace_at_global_index(2).unwrap();
+        assert_eq!(owner, left);
+
+        let selector = WorkspaceSelector::Index(2);
+        assert_eq!(
+            store.resolve_rule_workspace_with_policy(left, Some(&selector), None, false),
+            Ok(third),
+            "index 2 means global workspace 2, not this display's third"
+        );
+
+        // A rule naming a workspace owned by another display falls back to this one
+        // rather than assigning the window somewhere it was never moved.
+        let elsewhere = WorkspaceSelector::Index(5);
+        let resolved = store
+            .resolve_rule_workspace_with_policy(left, Some(&elsewhere), None, false)
+            .unwrap();
+        assert_eq!(store.workspace_space(resolved), Some(left));
     }
 
     #[test]

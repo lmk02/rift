@@ -1696,6 +1696,16 @@ mod tests {
     }
 
     #[test]
+    fn shipped_default_config_parses_and_is_valid() {
+        // rift.default.toml is compiled in as the defaults, so a typo here is a hard
+        // failure at startup rather than a doc bug.
+        let config = Config::default();
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+        assert!(!config.virtual_workspaces.shared_across_displays);
+        assert!(config.virtual_workspaces.workspace_display_assignment.is_empty());
+    }
+
+    #[test]
     fn move_workspace_to_display_binds_as_a_key_command() {
         #[derive(Deserialize)]
         struct TestConfig {

@@ -324,6 +324,8 @@ workspace_names = [
 #
 # Rule options:
 #   - workspace (integer, 0-based): target workspace index. If omitted or invalid, uses the active workspace.
+#     With shared_across_displays this is the global index; a rule naming a workspace owned by
+#     another display falls back to the display the window opened on.
 #     Alternatively, `workspace` may be a workspace name string to target by name.
 #   - floating (boolean): whether matched windows should float by default.
 #   - position ({ x, y }): initial normalized position for floating windows. Values range from
