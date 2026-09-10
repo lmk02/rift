@@ -8,7 +8,8 @@ use crate::common::collections::{HashMap, HashSet};
 #[cfg(test)]
 use crate::common::config::AppWorkspaceRule;
 use crate::common::config::{
-    LayoutMode, LayoutSettings, MAX_WORKSPACES, VirtualWorkspaceSettings, WorkspaceSelector,
+    DisplaySelector, LayoutMode, LayoutSettings, MAX_WORKSPACES, VirtualWorkspaceSettings,
+    WorkspaceDisplayAssignment, WorkspaceSelector,
 };
 use crate::common::log::trace_misc;
 use crate::layout_engine::Direction;
@@ -161,6 +162,14 @@ pub struct WorkspaceStore {
     pub default_layout_mode: LayoutMode,
     #[serde(skip)]
     pub layout_settings: LayoutSettings,
+    #[serde(skip)]
+    shared_across_displays: bool,
+    #[serde(skip)]
+    display_assignment: Vec<WorkspaceDisplayAssignment>,
+    /// Shared mode has one global namespace, so "the workspace I came from" is a
+    /// single value rather than one per space.
+    #[serde(skip)]
+    last_active_global: Option<VirtualWorkspaceId>,
 }
 
 impl Default for WorkspaceStore {
@@ -195,6 +204,9 @@ impl WorkspaceStore {
             workspace_rules: config.workspace_rules.clone(),
             default_layout_mode: layout_settings.mode,
             layout_settings: layout_settings.clone(),
+            shared_across_displays: config.shared_across_displays,
+            display_assignment: config.workspace_display_assignment.clone(),
+            last_active_global: None,
         }
     }
 
@@ -215,15 +227,33 @@ impl WorkspaceStore {
         self.default_workspace_names = config.workspace_names.clone();
         self.workspace_auto_back_and_forth = config.workspace_auto_back_and_forth;
         self.prevent_wrapping = config.prevent_wrapping;
+        self.shared_across_displays = config.shared_across_displays;
+        self.display_assignment = config.workspace_display_assignment.clone();
 
         let target_count = self.default_workspace_count.max(1).min(self.max_workspaces);
         self.default_workspace = config.default_workspace.min(target_count - 1);
 
         let spaces: Vec<SpaceId> = self.workspaces_by_space.keys().copied().collect();
-        for space in spaces {
-            if let Some(workspaces) = self.workspaces_by_space.get_mut(&space) {
+        for space in &spaces {
+            if let Some(workspaces) = self.workspaces_by_space.get_mut(space) {
                 workspaces.sort_unstable();
             }
+        }
+
+        if self.shared_across_displays {
+            // One global namespace: the pool is sized and named globally, not per display.
+            let Some(&home) = spaces.first() else {
+                return;
+            };
+            while self.ordered_workspace_ids_global().len() < target_count {
+                let index = self.ordered_workspace_ids_global().len();
+                self.push_default_workspace(home, index);
+            }
+            self.apply_default_names_global();
+            return;
+        }
+
+        for space in spaces {
             // Persisted workspace names are historical display metadata. Explicit names in the
             // current config remain authoritative after startup restore and config reload.
             if let Some(workspaces) = self.workspaces_by_space.get(&space) {
@@ -237,24 +267,48 @@ impl WorkspaceStore {
             }
             while self.workspaces_by_space.get(&space).unwrap().len() < target_count {
                 let idx = self.workspaces_by_space.get(&space).unwrap().len();
-                let name = if let Some(n) = self.default_workspace_names.get(idx) {
-                    n.clone()
-                } else {
-                    let name = format!("Workspace {}", self.workspace_counter);
-                    self.workspace_counter += 1;
-                    name
-                };
+                self.push_default_workspace(space, idx);
+            }
+        }
+    }
 
-                let mode = self.resolve_layout_mode_for_workspace(idx, &name);
-                let ws = VirtualWorkspace::new(name, space, mode, &self.layout_settings);
-                let id = self.workspaces.insert(ws);
-                self.workspaces_by_space.get_mut(&space).unwrap().push(id);
+    /// Creates one workspace on `space`, named from `workspace_names[index]` when the
+    /// config provides a name for that slot.
+    fn push_default_workspace(&mut self, space: SpaceId, index: usize) -> VirtualWorkspaceId {
+        let name = if let Some(name) = self.default_workspace_names.get(index) {
+            name.clone()
+        } else {
+            let name = format!("Workspace {}", self.workspace_counter);
+            self.workspace_counter += 1;
+            name
+        };
+        let mode = self.resolve_layout_mode_for_workspace(index, &name);
+        let workspace = VirtualWorkspace::new(name, space, mode, &self.layout_settings);
+        let id = self.workspaces.insert(workspace);
+        self.workspaces_by_space.entry(space).or_default().push(id);
+        id
+    }
+
+    fn apply_default_names_global(&mut self) {
+        for (index, id) in self.ordered_workspace_ids_global().into_iter().enumerate() {
+            if let Some(name) = self.default_workspace_names.get(index).cloned()
+                && let Some(workspace) = self.workspaces.get_mut(id)
+            {
+                workspace.name = name;
             }
         }
     }
 
     fn ensure_space_initialized(&mut self, space: SpaceId) {
         if self.workspaces_by_space.contains_key(&space) {
+            return;
+        }
+
+        // Shared mode has a single global pool, so a newly seen display must not mint a
+        // duplicate set. It is given an owner slot here and workspaces by
+        // `apply_display_topology`, which runs with the window store in hand.
+        if self.shared_across_displays && !self.workspaces.is_empty() {
+            self.workspaces_by_space.entry(space).or_default();
             return;
         }
 
@@ -278,6 +332,263 @@ impl WorkspaceStore {
         if let Some(&default_id) = ids.get(default_idx) {
             self.active_workspace_per_space.insert(space, (None, default_id));
         }
+    }
+
+    pub fn shared_across_displays(&self) -> bool { self.shared_across_displays }
+
+    /// Global ordinal view used when workspaces are shared across displays.
+    ///
+    /// Ordering is by slot-map key, i.e. creation order, exactly like the per-space
+    /// [`Self::ordered_workspace_ids`]. Keys are stable across serialization and do not
+    /// change when a workspace moves to another display, so a workspace keeps its global
+    /// number for its whole life — which is the point of a shared namespace.
+    pub fn ordered_workspace_ids_global(&self) -> Vec<VirtualWorkspaceId> {
+        let mut ids: Vec<_> = self
+            .workspaces_by_space
+            .values()
+            .flatten()
+            .copied()
+            .filter(|id| self.workspaces.contains_key(*id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    pub fn global_workspace_order(&self) -> Vec<(VirtualWorkspaceId, SpaceId)> {
+        self.ordered_workspace_ids_global()
+            .into_iter()
+            .filter_map(|id| self.workspaces.get(id).map(|ws| (id, ws.space)))
+            .collect()
+    }
+
+    pub fn workspace_at_global_index(
+        &self,
+        index: usize,
+    ) -> Option<(VirtualWorkspaceId, SpaceId)> {
+        let id = *self.ordered_workspace_ids_global().get(index)?;
+        self.workspaces.get(id).map(|ws| (id, ws.space))
+    }
+
+    pub fn global_index_of(&self, workspace_id: VirtualWorkspaceId) -> Option<usize> {
+        self.ordered_workspace_ids_global().iter().position(|id| *id == workspace_id)
+    }
+
+    pub fn local_index_of(
+        &self,
+        space: SpaceId,
+        workspace_id: VirtualWorkspaceId,
+    ) -> Option<usize> {
+        self.ordered_workspace_ids(space).iter().position(|id| *id == workspace_id)
+    }
+
+    pub fn last_active_global(&self) -> Option<VirtualWorkspaceId> { self.last_active_global }
+
+    /// Moves workspace ownership between spaces: the workspace record, both
+    /// `workspaces_by_space` entries, the active/previous slots on either side, and every
+    /// member window's composite `WindowWorkspaceInfo` key — which is what keeps
+    /// `WindowStore::workspace_windows` finding them after the move. Returns the member
+    /// windows so the caller can re-key layout state and move them on screen.
+    ///
+    /// Callers go through `LayoutEngine::move_workspace_to_space`, which also re-keys
+    /// `WorkspaceLayouts` and the floating stores.
+    pub(crate) fn relocate_workspace(
+        &mut self,
+        window_store: &mut WindowStore,
+        workspace_id: VirtualWorkspaceId,
+        new_space: SpaceId,
+    ) -> Vec<WindowId> {
+        let Some(old_space) = self.workspaces.get(workspace_id).map(|ws| ws.space) else {
+            return Vec::new();
+        };
+        if old_space == new_space {
+            return Vec::new();
+        }
+
+        let windows = window_store.workspace_windows(old_space, workspace_id);
+
+        if let Some(ids) = self.workspaces_by_space.get_mut(&old_space) {
+            ids.retain(|id| *id != workspace_id);
+        }
+        let target = self.workspaces_by_space.entry(new_space).or_default();
+        if !target.contains(&workspace_id) {
+            target.push(workspace_id);
+            target.sort_unstable();
+        }
+        if let Some(workspace) = self.workspaces.get_mut(workspace_id) {
+            workspace.space = new_space;
+        }
+
+        for &window in &windows {
+            window_store.assign_window_to_workspace(window, WindowWorkspaceInfo {
+                space: new_space,
+                workspace_id,
+            });
+        }
+
+        self.repair_active_after_relocate(old_space, new_space, workspace_id);
+        windows
+    }
+
+    /// Reconciles the global workspace pool with the live display topology.
+    ///
+    /// `visible` is every attached display's current space, in physical order. Shared mode
+    /// only; a no-op otherwise. Runs after `remap_space` so it sees post-churn space ids.
+    pub fn apply_display_topology(
+        &mut self,
+        window_store: &mut WindowStore,
+        visible: &[(SpaceId, Option<String>)],
+    ) {
+        if !self.shared_across_displays {
+            return;
+        }
+        let Some(&(home, _)) = visible.first() else {
+            return;
+        };
+
+        // The pool is created once, in config order, so global indices are deterministic
+        // rather than depending on which display rift happened to see first.
+        let target_count = self.default_workspace_count.max(1).min(self.max_workspaces);
+        while self.ordered_workspace_ids_global().len() < target_count {
+            let index = self.ordered_workspace_ids_global().len();
+            self.push_default_workspace(home, index);
+        }
+        self.active_workspace_per_space.entry(home).or_insert_with(|| {
+            let default = self
+                .workspaces_by_space
+                .get(&home)
+                .and_then(|ids| ids.get(self.default_workspace).or_else(|| ids.first()))
+                .copied();
+            (None, default.expect("pool was just created on this space"))
+        });
+
+        self.apply_display_assignment(window_store, visible);
+        self.rehome_detached_workspaces(window_store, home, visible);
+        self.ensure_every_display_owns_a_workspace(window_store, visible);
+    }
+
+    fn apply_display_assignment(
+        &mut self,
+        window_store: &mut WindowStore,
+        visible: &[(SpaceId, Option<String>)],
+    ) {
+        for assignment in self.display_assignment.clone() {
+            let workspace = match &assignment.workspace {
+                WorkspaceSelector::Index(index) => {
+                    self.workspace_at_global_index(*index).map(|(id, _)| id)
+                }
+                WorkspaceSelector::Name(name) => self
+                    .ordered_workspace_ids_global()
+                    .into_iter()
+                    .find(|id| self.workspaces.get(*id).is_some_and(|ws| &ws.name == name)),
+            };
+            let space = match &assignment.display {
+                DisplaySelector::Index(index) => {
+                    visible.get(index.saturating_sub(1)).map(|(space, _)| *space)
+                }
+                DisplaySelector::Uuid(uuid) => visible
+                    .iter()
+                    .find(|(_, candidate)| candidate.as_deref() == Some(uuid.as_str()))
+                    .map(|(space, _)| *space),
+                // Rejected by config validation; a direction has no stable owner.
+                DisplaySelector::Direction(_) => None,
+            };
+            if let (Some(workspace), Some(space)) = (workspace, space) {
+                self.relocate_workspace(window_store, workspace, space);
+            }
+        }
+    }
+
+    /// A display that goes away must not strand its workspaces: in shared mode their global
+    /// numbers would still resolve, but the space can never be activated or arranged.
+    fn rehome_detached_workspaces(
+        &mut self,
+        window_store: &mut WindowStore,
+        home: SpaceId,
+        visible: &[(SpaceId, Option<String>)],
+    ) {
+        let detached: Vec<SpaceId> = self
+            .workspaces_by_space
+            .keys()
+            .copied()
+            .filter(|space| !visible.iter().any(|(visible, _)| visible == space))
+            .collect();
+        for space in detached {
+            for workspace in self.ordered_workspace_ids(space) {
+                self.relocate_workspace(window_store, workspace, home);
+            }
+            self.workspaces_by_space.remove(&space);
+            self.active_workspace_per_space.remove(&space);
+        }
+    }
+
+    fn ensure_every_display_owns_a_workspace(
+        &mut self,
+        window_store: &mut WindowStore,
+        visible: &[(SpaceId, Option<String>)],
+    ) {
+        for &(space, _) in visible {
+            if !self.ordered_workspace_ids(space).is_empty() {
+                self.active_workspace_per_space.entry(space).or_insert_with(|| {
+                    let first = self.workspaces_by_space[&space][0];
+                    (None, first)
+                });
+                continue;
+            }
+            let donor = self
+                .workspaces_by_space
+                .iter()
+                .filter(|(owner, ids)| **owner != space && ids.len() > 1)
+                .max_by_key(|(_, ids)| ids.len())
+                .map(|(owner, _)| *owner);
+            let Some(donor) = donor else {
+                continue;
+            };
+            let Some(moved) = self
+                .ordered_workspace_ids(donor)
+                .into_iter()
+                .rev()
+                .find(|id| self.active_workspace(donor) != Some(*id))
+            else {
+                continue;
+            };
+            self.relocate_workspace(window_store, moved, space);
+        }
+    }
+
+    fn repair_active_after_relocate(
+        &mut self,
+        old_space: SpaceId,
+        new_space: SpaceId,
+        moved: VirtualWorkspaceId,
+    ) {
+        // The source must never be left pointing at a workspace it no longer owns.
+        let replacement = self.ordered_workspace_ids(old_space).first().copied();
+        match self.active_workspace_per_space.get(&old_space).copied() {
+            Some((previous, active)) => {
+                let previous = previous.filter(|id| *id != moved);
+                if active == moved {
+                    match replacement {
+                        Some(replacement) => {
+                            self.active_workspace_per_space
+                                .insert(old_space, (previous, replacement));
+                        }
+                        None => {
+                            self.active_workspace_per_space.remove(&old_space);
+                        }
+                    }
+                } else {
+                    self.active_workspace_per_space.insert(old_space, (previous, active));
+                }
+            }
+            None => {
+                if let Some(replacement) = replacement {
+                    self.active_workspace_per_space.insert(old_space, (None, replacement));
+                }
+            }
+        }
+
+        self.active_workspace_per_space.entry(new_space).or_insert((None, moved));
     }
 
     fn resolve_layout_mode_for_workspace(&self, index: usize, name: &str) -> LayoutMode {
@@ -493,6 +804,9 @@ impl WorkspaceStore {
                 && self.workspaces.get(workspace_id).map(|w| w.space) == Some(space)
             {
                 self.active_workspace_per_space.insert(space, (active, workspace_id));
+                if let Some(active) = active.filter(|active| *active != workspace_id) {
+                    self.last_active_global = Some(active);
+                }
                 true
             } else {
                 error!(
@@ -514,28 +828,58 @@ impl WorkspaceStore {
         skip_empty: Option<bool>,
         dir: Direction,
     ) -> Option<VirtualWorkspaceId> {
-        let ids = self.ordered_workspace_ids(space);
-        if ids.is_empty() {
+        let order: Vec<_> =
+            self.ordered_workspace_ids(space).into_iter().map(|id| (id, space)).collect();
+        self.step_workspace_in_order(window_store, &order, current, skip_empty, dir)
+            .map(|(id, _)| id)
+    }
+
+    /// Steps through an explicit workspace order. The per-space order gives today's
+    /// behavior; the global order (shared mode) lets a step cross a display boundary, and
+    /// makes `prevent_wrapping` and `skip_empty` apply to the whole namespace rather than
+    /// to one display's slice of it.
+    pub fn step_workspace_in_order(
+        &self,
+        window_store: &WindowStore,
+        order: &[(VirtualWorkspaceId, SpaceId)],
+        current: VirtualWorkspaceId,
+        skip_empty: Option<bool>,
+        dir: Direction,
+    ) -> Option<(VirtualWorkspaceId, SpaceId)> {
+        if order.is_empty() {
             return None;
         }
-        let mut index = ids.iter().position(|&id| id == current)?;
+        let mut index = order.iter().position(|(id, _)| *id == current)?;
         let require_non_empty = skip_empty == Some(true);
 
-        for _ in 0..ids.len() {
+        for _ in 0..order.len() {
             index = match dir {
-                Direction::Right if index + 1 < ids.len() => index + 1,
+                Direction::Right if index + 1 < order.len() => index + 1,
                 Direction::Left if index > 0 => index - 1,
                 Direction::Right if !self.prevent_wrapping => 0,
-                Direction::Left if !self.prevent_wrapping => ids.len() - 1,
+                Direction::Left if !self.prevent_wrapping => order.len() - 1,
                 _ => return None,
             };
 
-            let id = ids[index];
-            if !require_non_empty || !self.workspace_windows(window_store, space, id).is_empty() {
-                return Some(id);
+            let (id, space) = order[index];
+            if !require_non_empty
+                || !self.workspace_windows(window_store, space, id).is_empty()
+            {
+                return Some((id, space));
             }
         }
         None
+    }
+
+    pub fn step_workspace_global(
+        &self,
+        window_store: &WindowStore,
+        current: VirtualWorkspaceId,
+        skip_empty: Option<bool>,
+        dir: Direction,
+    ) -> Option<(VirtualWorkspaceId, SpaceId)> {
+        let order = self.global_workspace_order();
+        self.step_workspace_in_order(window_store, &order, current, skip_empty, dir)
     }
 
     pub fn next_workspace(
@@ -607,6 +951,16 @@ impl WorkspaceStore {
         let existing_assignment = window_store.workspace_info_for_window(window_id)?;
         if existing_assignment.space == space {
             return Some(existing_assignment.workspace_id);
+        }
+
+        // Ordinals are per display, so preserving one across spaces would drop the window
+        // into an unrelated global workspace that merely shares an index. In shared mode a
+        // window that changed display joins that display's active workspace instead.
+        if self.shared_across_displays {
+            let target_workspace_id = self.active_workspace(space)?;
+            return self
+                .assign_window_to_workspace(window_store, space, window_id, target_workspace_id)
+                .then_some(target_workspace_id);
         }
 
         let source_index = self
@@ -1216,6 +1570,169 @@ mod tests {
             ax_role,
             ax_subrole,
         ))
+    }
+
+    fn shared_store(count: usize) -> WorkspaceStore {
+        let config = VirtualWorkspaceSettings {
+            shared_across_displays: true,
+            default_workspace_count: count,
+            workspace_names: Vec::new(),
+            ..Default::default()
+        };
+        WorkspaceStore::new_with_config(&config, &LayoutSettings::default())
+    }
+
+    #[test]
+    fn shared_mode_creates_one_global_pool_not_one_set_per_display() {
+        let mut store = shared_store(6);
+        let mut windows = WindowStore::default();
+        let left = SpaceId::new(1);
+        let right = SpaceId::new(2);
+
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+
+        assert_eq!(store.ordered_workspace_ids_global().len(), 6);
+        assert_eq!(
+            store.ordered_workspace_ids(left).len() + store.ordered_workspace_ids(right).len(),
+            6,
+            "the pool is shared, not duplicated per display"
+        );
+        assert!(store.active_workspace(left).is_some());
+        assert!(
+            store.active_workspace(right).is_some(),
+            "every attached display must own and show a workspace"
+        );
+    }
+
+    #[test]
+    fn display_assignment_places_workspaces_and_global_index_survives_the_move() {
+        let mut store = shared_store(6);
+        store.display_assignment = vec![
+            WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(4),
+                display: DisplaySelector::Index(2),
+            },
+            WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(5),
+                display: DisplaySelector::Index(2),
+            },
+        ];
+        let mut windows = WindowStore::default();
+        let left = SpaceId::new(1);
+        let right = SpaceId::new(2);
+
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+
+        let (workspace, owner) = store.workspace_at_global_index(4).unwrap();
+        assert_eq!(owner, right);
+        assert_eq!(store.global_index_of(workspace), Some(4));
+        assert_eq!(store.local_index_of(right, workspace), Some(0));
+        assert_eq!(store.ordered_workspace_ids(left).len(), 4);
+        assert_eq!(store.ordered_workspace_ids(right).len(), 2);
+    }
+
+    #[test]
+    fn relocating_a_workspace_moves_its_windows_composite_assignment() {
+        let mut store = shared_store(4);
+        let mut windows = WindowStore::default();
+        let left = SpaceId::new(1);
+        let right = SpaceId::new(2);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+
+        let (workspace, owner) = store.workspace_at_global_index(0).unwrap();
+        assert_eq!(owner, left);
+        let window = WindowId::new(1, 1);
+        assert!(store.assign_window_to_workspace(&mut windows, left, window, workspace));
+
+        let moved = store.relocate_workspace(&mut windows, workspace, right);
+
+        assert_eq!(moved, vec![window]);
+        assert_eq!(store.workspace_at_global_index(0), Some((workspace, right)));
+        assert_eq!(
+            windows.workspace_windows(right, workspace),
+            vec![window],
+            "the composite (space, workspace) key must follow the workspace"
+        );
+        assert!(windows.workspace_windows(left, workspace).is_empty());
+        assert!(
+            store.active_workspace(left).is_some_and(|active| active != workspace),
+            "the source display must not keep pointing at a workspace it no longer owns"
+        );
+    }
+
+    #[test]
+    fn detaching_a_display_rehomes_its_workspaces_instead_of_stranding_them() {
+        let mut store = shared_store(6);
+        store.display_assignment = vec![WorkspaceDisplayAssignment {
+            workspace: WorkspaceSelector::Index(5),
+            display: DisplaySelector::Index(2),
+        }];
+        let mut windows = WindowStore::default();
+        let left = SpaceId::new(1);
+        let right = SpaceId::new(2);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+        let (stranded, _) = store.workspace_at_global_index(5).unwrap();
+
+        store.apply_display_topology(&mut windows, &[(left, None)]);
+
+        assert_eq!(store.workspace_at_global_index(5), Some((stranded, left)));
+        assert_eq!(store.ordered_workspace_ids_global().len(), 6);
+        assert!(store.active_workspace(right).is_none());
+    }
+
+    #[test]
+    fn global_stepping_crosses_displays_and_wraps_over_the_whole_namespace() {
+        let mut store = shared_store(4);
+        store.display_assignment = vec![
+            WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(2),
+                display: DisplaySelector::Index(2),
+            },
+            WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(3),
+                display: DisplaySelector::Index(2),
+            },
+        ];
+        let mut windows = WindowStore::default();
+        let left = SpaceId::new(1);
+        let right = SpaceId::new(2);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+
+        let last_on_left = store.workspace_at_global_index(1).unwrap().0;
+        assert_eq!(
+            store.step_workspace_global(&windows, last_on_left, None, Direction::Right),
+            store.workspace_at_global_index(2),
+            "stepping past the last workspace of a display continues onto the next display"
+        );
+
+        let last_global = store.workspace_at_global_index(3).unwrap().0;
+        assert_eq!(
+            store.step_workspace_global(&windows, last_global, None, Direction::Right),
+            store.workspace_at_global_index(0),
+            "wrapping wraps the whole namespace"
+        );
+
+        store.prevent_wrapping = true;
+        assert_eq!(
+            store.step_workspace_global(&windows, last_global, None, Direction::Right),
+            None
+        );
+    }
+
+    #[test]
+    fn per_space_stepping_is_unchanged_when_shared_mode_is_off() {
+        let mut store = WorkspaceStore::new();
+        let windows = WindowStore::default();
+        let space = SpaceId::new(1);
+        let ids: Vec<_> =
+            store.list_workspaces(space).into_iter().map(|(id, _)| id).collect();
+
+        assert_eq!(store.next_workspace(&windows, space, ids[0], None), Some(ids[1]));
+        assert_eq!(
+            store.next_workspace(&windows, space, *ids.last().unwrap(), None),
+            Some(ids[0])
+        );
+        assert_eq!(store.prev_workspace(&windows, space, ids[0], None), ids.last().copied());
     }
 
     #[test]

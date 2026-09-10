@@ -3,7 +3,9 @@ use std::str::FromStr;
 
 use anyhow::bail;
 use regex::RegexBuilder;
-pub use rift_protocol::{AnimationEasing, ConfigCommand, LayoutMode, WorkspaceSelector};
+pub use rift_protocol::{
+    AnimationEasing, ConfigCommand, DisplaySelector, LayoutMode, WorkspaceSelector,
+};
 use serde::{Deserialize, Serialize};
 
 use super::collections::HashMap;
@@ -50,6 +52,12 @@ pub struct VirtualWorkspaceSettings {
     pub app_rules: Vec<AppWorkspaceRule>,
     #[serde(default)]
     pub workspace_rules: Vec<WorkspaceLayoutRule>,
+    /// Treat workspaces as one global namespace shared by all displays (i3/aerospace
+    /// style) instead of giving every display its own independent set.
+    #[serde(default = "no")]
+    pub shared_across_displays: bool,
+    #[serde(default)]
+    pub workspace_display_assignment: Vec<WorkspaceDisplayAssignment>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -59,6 +67,16 @@ pub struct WorkspaceLayoutRule {
     pub workspace: WorkspaceSelector,
     /// Layout mode to use for this workspace
     pub layout: LayoutMode,
+}
+
+/// Which display owns a workspace in `shared_across_displays` mode.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDisplayAssignment {
+    /// Target workspace by global index or name
+    pub workspace: WorkspaceSelector,
+    /// Display by 1-based index in physical order, or by display UUID
+    pub display: DisplaySelector,
 }
 
 // Allow specifying a workspace by numeric index or by name in the config.
@@ -139,6 +157,8 @@ impl Default for VirtualWorkspaceSettings {
             reapply_app_rules_on_title_change: false,
             app_rules: Vec::new(),
             workspace_rules: Vec::new(),
+            shared_across_displays: false,
+            workspace_display_assignment: Vec::new(),
         }
     }
 }
@@ -166,6 +186,23 @@ impl VirtualWorkspaceSettings {
                 "default_workspace ({}) must be less than default_workspace_count ({})",
                 self.default_workspace, self.default_workspace_count
             ));
+        }
+
+        for assignment in &self.workspace_display_assignment {
+            if let WorkspaceSelector::Index(index) = &assignment.workspace
+                && *index >= self.default_workspace_count
+            {
+                issues.push(format!(
+                    "workspace_display_assignment targets workspace {} but only {} workspaces exist",
+                    index, self.default_workspace_count
+                ));
+            }
+            if matches!(assignment.display, DisplaySelector::Direction(_)) {
+                issues.push(
+                    "workspace_display_assignment display must be an index or a display UUID,                      not a direction"
+                        .to_string(),
+                );
+            }
         }
 
         // Validate rules and check duplicates in a single pass
@@ -1656,6 +1693,68 @@ mod tests {
         let settings: VirtualWorkspaceSettings =
             toml::from_str("prevent_wrapping_around = true").unwrap();
         assert!(settings.prevent_wrapping);
+    }
+
+    #[test]
+    fn shared_across_displays_defaults_off_and_parses_display_assignment() {
+        let defaults: VirtualWorkspaceSettings = toml::from_str("").unwrap();
+        assert!(!defaults.shared_across_displays);
+        assert!(defaults.workspace_display_assignment.is_empty());
+
+        let settings: VirtualWorkspaceSettings = toml::from_str(
+            r#"
+            shared_across_displays = true
+            default_workspace_count = 10
+            workspace_display_assignment = [
+                { workspace = 5, display = 2 },
+                { workspace = "sixth", display = "37D8832A-2D66-02CA-B9F7-8F30A301B230" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        assert!(settings.shared_across_displays);
+        assert_eq!(
+            settings.workspace_display_assignment[0],
+            WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(5),
+                display: DisplaySelector::Index(2),
+            }
+        );
+        assert_eq!(
+            settings.workspace_display_assignment[1],
+            WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Name("sixth".to_string()),
+                display: DisplaySelector::Uuid(
+                    "37D8832A-2D66-02CA-B9F7-8F30A301B230".to_string()
+                ),
+            }
+        );
+        assert!(settings.validate().is_empty());
+    }
+
+    #[test]
+    fn workspace_display_assignment_rejects_directions_and_out_of_range_workspaces() {
+        let settings: VirtualWorkspaceSettings = toml::from_str(
+            r#"
+            default_workspace_count = 4
+            workspace_display_assignment = [
+                { workspace = 7, display = 1 },
+                { workspace = 0, display = "left" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let issues = settings.validate();
+        assert!(
+            issues.iter().any(|issue| issue.contains("only 4 workspaces exist")),
+            "{issues:?}"
+        );
+        assert!(
+            issues.iter().any(|issue| issue.contains("not a direction")),
+            "{issues:?}"
+        );
     }
 
     #[test]

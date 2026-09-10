@@ -262,6 +262,12 @@ drag_swap_fraction = 0.3
 # - prevent_wrapping: when true, next/previous workspace switching stops at the first/last
 #   workspace instead of wrapping around
 # - reapply_app_rules_on_title_change: if true, app rules are re-evaluated when a window's title changes
+# - shared_across_displays: i3/aerospace style workspaces. When false (default) every display
+#   owns its own independent set of workspaces and `switch_to_workspace = N` only ever acts on
+#   the display you are looking at. When true there is a single global namespace: each workspace
+#   is owned by one display at a time, and switching to a workspace owned by another display
+#   activates it there and moves focus to that display. next/prev workspace and
+#   move_window_to_workspace cross display boundaries the same way.
 enabled = true
 default_workspace_count = 4
 auto_assign_windows = true
@@ -278,6 +284,19 @@ reapply_app_rules_on_title_change = false
 #   { workspace = "second", layout = "scrolling" }
 # ]
 workspace_rules = []
+
+#shared_across_displays = false
+
+# Which display owns which workspace, in shared_across_displays mode. Workspaces that are not
+# listed start on the first display. This is what makes a split like "1-5 left, 6-10 right"
+# survive a fresh install or a display being replugged.
+# - workspace: global workspace index (0-based) or name
+# - display: 1-based index in physical order (left to right), or a display UUID string
+# workspace_display_assignment = [
+#   { workspace = 5, display = 2 },
+#   { workspace = 6, display = 2 },
+# ]
+workspace_display_assignment = []
 
 
 # Default workspace to activate on startup (0-based index).
@@ -413,6 +432,8 @@ comb1 = "Alt + Shift"
 # - swap_windows = [123, 456]
 # - exec = "command" | exec = ["cmd", "arg1", "..."]
 # - move_mouse_to_display = "left"|"right"|"up"|"down"|N|"<display_uuid>"
+# - move_workspace_to_display = "left"|"right"|"up"|"down"|N|"<display_uuid>"
+# - move_workspace_to_display = { selector = ..., workspace = N } (workspace is optional)
 # - move_window_to_display = { selector = "left"|"right"|"up"|"down"|N|"<display_uuid>", window_id = 123 }
 # - close_window / close_window = { window_server_id = 123 } (optional window id)
 # - focus_window = { window_id = 123, window_server_id = 456 }
