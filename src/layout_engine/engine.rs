@@ -2895,6 +2895,9 @@ impl LayoutEngine {
         self.virtual_workspace_manager.active_workspace_idx(space)
     }
 
+    /// Moves a window to `target_space`. `target_workspace` picks a specific workspace
+    /// there; `None` keeps the historical behavior of landing on whatever that display is
+    /// currently showing.
     pub fn move_window_to_space(
         &mut self,
         window_store: &mut WindowStore,
@@ -2902,6 +2905,7 @@ impl LayoutEngine {
         target_space: SpaceId,
         target_screen_size: CGSize,
         window_id: WindowId,
+        target_workspace: Option<VirtualWorkspaceId>,
     ) -> EventResponse {
         if source_space == target_space {
             return EventResponse {
@@ -2924,7 +2928,11 @@ impl LayoutEngine {
             return EventResponse::default();
         };
 
-        let mut target_workspace_id = self.virtual_workspace_manager.active_workspace(target_space);
+        let mut target_workspace_id = target_workspace
+            .filter(|workspace| {
+                self.virtual_workspace_manager.workspace_space(*workspace) == Some(target_space)
+            })
+            .or_else(|| self.virtual_workspace_manager.active_workspace(target_space));
         if target_workspace_id.is_none() {
             if let Some((id, _)) =
                 self.virtual_workspace_manager.list_workspaces(target_space).first()
@@ -3011,7 +3019,15 @@ impl LayoutEngine {
             target_workspace_id,
             Some(window_id),
         );
-        self.focused_window = Some(window_id);
+        // Landing in a workspace the target display is not showing means the window is
+        // parked offscreen; focusing it would raise something nobody can see.
+        let lands_visible =
+            self.virtual_workspace_manager.active_workspace(target_space) == Some(target_workspace_id);
+        if lands_visible {
+            self.focused_window = Some(window_id);
+        } else if self.focused_window == Some(window_id) {
+            self.focused_window = None;
+        }
 
         if source_space != target_space {
             self.broadcast_windows_changed(window_store, source_space);
@@ -3020,8 +3036,8 @@ impl LayoutEngine {
 
         EventResponse {
             changed: true,
-            raise_windows: vec![window_id],
-            focus_window: Some(window_id),
+            raise_windows: if lands_visible { vec![window_id] } else { Vec::new() },
+            focus_window: lands_visible.then_some(window_id),
             boundary_hit: None,
         }
     }
@@ -3660,6 +3676,7 @@ mod tests {
             target_space,
             target_screen.size,
             wid,
+            None,
         );
 
         assert_eq!(response.focus_window, Some(wid));

@@ -407,6 +407,8 @@ pub struct MoveWindowToDisplayPayload {
     pub target_space: SpaceId,
     pub target_screen: objc2_core_foundation::CGRect,
     pub target_frame: objc2_core_foundation::CGRect,
+    /// Land on this workspace rather than whatever the target display is showing.
+    pub target_workspace: Option<crate::model::VirtualWorkspaceId>,
 }
 
 pub fn handle_command_reactor_move_window_to_display(
@@ -427,6 +429,7 @@ pub fn handle_command_reactor_move_window_to_display(
         payload.target_space,
         payload.target_screen.size,
         payload.window,
+        payload.target_workspace,
     );
 
     if state

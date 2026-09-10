@@ -1906,6 +1906,16 @@ impl Reactor {
             Event::Command(Command::Layout(mut command)) => {
                 let post_arrange_mouse_warp =
                     self.config.settings.mouse_follows_focus.then(|| self.main_window()).flatten();
+                if let layout::LayoutCommand::MoveWindowToWorkspace {
+                    workspace,
+                    follow,
+                    window_id,
+                } = &command
+                    && let Some(result) =
+                        self.shared_move_window_to_workspace(workspace, *follow, *window_id)
+                {
+                    return result;
+                }
                 let mut command_space = self.command_context_space();
                 let mut focus_display_space = None;
                 match self.resolve_shared_workspace_command(&command, command_space) {
@@ -2029,15 +2039,7 @@ impl Reactor {
                 if source_space == target_space {
                     return Ok(EventOutcome::no_change());
                 }
-                let mut target_frame = window_frame;
-                let mut origin = target_screen.frame.mid();
-                origin.x -= window_frame.size.width / 2.0;
-                origin.y -= window_frame.size.height / 2.0;
-                let min = target_screen.frame.min();
-                let max = target_screen.frame.max();
-                origin.x = origin.x.max(min.x).min(max.x - window_frame.size.width);
-                origin.y = origin.y.max(min.y).min(max.y - window_frame.size.height);
-                target_frame.origin = origin;
+                let target_frame = Self::centered_frame_on_screen(window_frame, target_screen.frame);
                 return command_workflow::handle_command_reactor_move_window_to_display(
                     &mut self.state,
                     &mut self.layout_manager,
@@ -2048,6 +2050,7 @@ impl Reactor {
                         target_space,
                         target_screen: target_screen.frame,
                         target_frame,
+                        target_workspace: None,
                     },
                 );
             }
@@ -2505,6 +2508,7 @@ impl Reactor {
                         target_space,
                         target_screen_size,
                         window_id,
+                        None,
                     );
                     self.handle_layout_response(response, None);
                 }
@@ -4946,6 +4950,145 @@ impl Reactor {
                 focus_window_center,
             },
         )
+    }
+
+    /// Sends a window to a workspace owned by another display, in shared mode.
+    ///
+    /// Returns `None` when this does not apply — shared mode off, unresolvable, or the
+    /// target workspace is on the window's own display — so the caller runs the ordinary
+    /// same-display path.
+    fn shared_move_window_to_workspace(
+        &mut self,
+        selector: &crate::common::config::WorkspaceSelector,
+        follow: bool,
+        window_index: Option<u32>,
+    ) -> Option<anyhow::Result<EventOutcome>> {
+        if !self.config.virtual_workspaces.shared_across_displays || self.is_in_drag() {
+            return None;
+        }
+        let command_space = self.command_context_space()?;
+        let window = match window_index {
+            Some(index) => {
+                let workspaces = self.layout_manager.layout_engine.virtual_workspace_manager();
+                self.iter_active_spaces()
+                    .find_map(|space| {
+                        workspaces.find_window_by_idx(&self.state.windows, space, index)
+                    })?
+            }
+            // Mirrors the same-display path, which operates on the layout engine's
+            // focused window.
+            None => self
+                .layout_manager
+                .layout_engine
+                .focused_window()
+                .or_else(|| self.main_window())
+                .or_else(|| self.window_id_under_cursor())?,
+        };
+        let window_state = self.state.windows.window(window)?;
+        let window_server_id = window_state.info.sys_id;
+        let window_frame = window_state.frame_monotonic;
+        let source_space = self
+            .assigned_space_for_window_id(window)
+            .or_else(|| self.best_space_for_window_id(window))
+            .filter(|space| self.is_space_active(*space))
+            .unwrap_or(command_space);
+
+        let workspaces = self.layout_manager.layout_engine.virtual_workspace_manager();
+        let current = workspaces.workspace_for_window(&self.state.windows, source_space, window);
+        let (target_workspace, target_space) = match selector {
+            crate::common::config::WorkspaceSelector::Index(index) => workspaces.workspace_at_global_index(*index)?,
+            crate::common::config::WorkspaceSelector::Name(name) if name == "next" || name == "prev" => {
+                let direction =
+                    if name == "next" { Direction::Right } else { Direction::Left };
+                workspaces.step_workspace_global(
+                    &self.state.windows,
+                    current?,
+                    None,
+                    direction,
+                )?
+            }
+            crate::common::config::WorkspaceSelector::Name(name) => workspaces
+                .global_workspace_order()
+                .into_iter()
+                .find(|(id, space)| {
+                    workspaces.workspace_info(*space, *id).is_some_and(|ws| &ws.name == name)
+                })?,
+        };
+        if target_space == source_space {
+            return None;
+        }
+        if !self.is_space_active(target_space) {
+            warn!(?target_space, "Move window to workspace ignored: its display is inactive");
+            return Some(Ok(EventOutcome::no_change()));
+        }
+        let target_screen = self.space_state.screen_by_space(target_space)?.frame;
+
+        let mut outcome = EventOutcome::no_change();
+        if follow {
+            // Activate first so the window lands in a workspace that is on screen, which
+            // is what makes the subsequent focus meaningful.
+            let local = self
+                .layout_manager
+                .layout_engine
+                .virtual_workspace_manager()
+                .local_index_of(target_space, target_workspace)?;
+            let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(false);
+            match command_workflow::handle_command_layout(
+                &mut self.state,
+                &mut self.layout_manager,
+                &mut self.workspace_switch_manager,
+                command_workflow::LayoutCommandPayload {
+                    command: layout::LayoutCommand::SwitchToWorkspace(local),
+                    command_space: Some(target_space),
+                    visible_spaces,
+                    visible_space_centers,
+                    post_arrange_mouse_warp: None,
+                },
+            ) {
+                Ok(switched) => outcome.absorb(switched),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+
+        let moved = command_workflow::handle_command_reactor_move_window_to_display(
+            &mut self.state,
+            &mut self.layout_manager,
+            command_workflow::MoveWindowToDisplayPayload {
+                window,
+                window_server_id,
+                source_space,
+                target_space,
+                target_screen,
+                target_frame: Self::centered_frame_on_screen(window_frame, target_screen),
+                target_workspace: Some(target_workspace),
+            },
+        );
+        match moved {
+            Ok(moved) => outcome.absorb(moved),
+            Err(error) => return Some(Err(error)),
+        }
+        // Two displays changed, so scoping the arrange to one of them would leave the
+        // other's windows where they were.
+        outcome = outcome.with_arrange_space_scope(None);
+        if follow {
+            match self.focus_display_outcome(target_space) {
+                Ok(focus) => outcome.absorb(focus),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        Some(Ok(outcome))
+    }
+
+    /// Centers `frame` on `screen`, clamped so the window stays fully on it.
+    fn centered_frame_on_screen(frame: CGRect, screen: CGRect) -> CGRect {
+        let mut origin = screen.mid();
+        origin.x -= frame.size.width / 2.0;
+        origin.y -= frame.size.height / 2.0;
+        let min = screen.min();
+        let max = screen.max();
+        origin.x = origin.x.max(min.x).min(max.x - frame.size.width);
+        origin.y = origin.y.max(min.y).min(max.y - frame.size.height);
+        CGRect::new(origin, frame.size)
     }
 
     /// Reconciles the shared workspace pool with the attached displays. No-op unless

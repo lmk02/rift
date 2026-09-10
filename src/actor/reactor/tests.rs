@@ -5898,3 +5898,111 @@ fn per_display_queries_keep_local_indices_when_shared_mode_is_off() {
         (0..4).collect::<Vec<_>>()
     );
 }
+
+/// A window on the left display, assigned to the workspace that display is showing.
+fn seed_window_on_left(reactor: &mut Reactor, left_space: SpaceId) -> WindowId {
+    let window = WindowId::new(1, 1);
+    reactor.add_test_app(1);
+    reactor.add_test_window(
+        window,
+        WindowServerId::new(101),
+        Some(left_space),
+        CGRect::new(CGPoint::new(100., 100.), CGSize::new(300., 200.)),
+    );
+    let workspace = reactor
+        .layout_manager
+        .layout_engine
+        .active_workspace(left_space)
+        .expect("the left display shows a workspace");
+    assert!(reactor.assign_test_window_to_workspace(left_space, window, workspace));
+    reactor.send_layout_event(LayoutEvent::WindowAdded(left_space, window));
+    reactor.send_layout_event(LayoutEvent::WindowFocused(left_space, window));
+    window
+}
+
+#[test]
+fn move_window_to_a_workspace_owned_by_another_display_moves_it_there() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let window = seed_window_on_left(&mut reactor, left_space);
+    let (target, _) = global_workspace(&reactor, 7);
+    let right_active_before = reactor.layout_manager.layout_engine.active_workspace(right_space);
+
+    let outcome = reactor.dispatch_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Index(7),
+        follow: false,
+        window_id: None,
+    });
+
+    let assignment = reactor
+        .state
+        .windows
+        .workspace_info_for_window(window)
+        .expect("the window keeps an assignment");
+    assert_eq!(assignment.space, right_space);
+    assert_eq!(assignment.workspace_id, target);
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(right_space),
+        right_active_before,
+        "follow = false must not change what either display is showing"
+    );
+    assert!(
+        outcome.mouse_warps.is_empty(),
+        "follow = false must not drag focus to the other display"
+    );
+    let write = outcome
+        .pre_layout_window_frame_writes
+        .iter()
+        .find(|write| write.window == window)
+        .expect("the window is written onto the target display before the arrange pass");
+    let right_screen = reactor.space_state.screen_by_space(right_space).unwrap().frame;
+    assert!(right_screen.contains(write.frame.mid()));
+}
+
+#[test]
+fn move_window_to_another_display_with_follow_activates_and_focuses_it() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let window = seed_window_on_left(&mut reactor, left_space);
+    let (target, _) = global_workspace(&reactor, 7);
+
+    let outcome = reactor.dispatch_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Index(7),
+        follow: true,
+        window_id: None,
+    });
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(right_space),
+        Some(target)
+    );
+    assert_eq!(
+        reactor.state.windows.workspace_info_for_window(window).map(|info| info.space),
+        Some(right_space)
+    );
+    assert!(!outcome.mouse_warps.is_empty(), "follow = true takes focus with the window");
+    assert_eq!(outcome.arrange.space_scope, None, "both displays changed");
+}
+
+#[test]
+fn move_window_to_a_workspace_on_the_same_display_is_unchanged_by_shared_mode() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let window = seed_window_on_left(&mut reactor, left_space);
+    let (target, owner) = global_workspace(&reactor, 2);
+    assert_eq!(owner, left_space);
+
+    reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Index(2),
+        follow: false,
+        window_id: None,
+    });
+
+    let assignment = reactor.state.windows.workspace_info_for_window(window).unwrap();
+    assert_eq!(assignment.space, left_space);
+    assert_eq!(assignment.workspace_id, target);
+    assert!(
+        reactor
+            .state
+            .windows
+            .workspace_windows(right_space, target)
+            .is_empty()
+    );
+}
