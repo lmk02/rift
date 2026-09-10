@@ -5848,3 +5848,53 @@ fn workspace_switching_stays_per_display_when_shared_mode_is_off() {
         right_active_before
     );
 }
+
+#[test]
+fn shared_mode_reports_global_workspace_indices_to_clients() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+
+    let rows = reactor.query_workspaces(None);
+
+    assert_eq!(rows.len(), 10, "the whole namespace, not one display's slice");
+    assert_eq!(
+        rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+        (0..10).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace_idx(left_space),
+        Some(0)
+    );
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace_idx(right_space),
+        Some(5),
+        "the right display reports the global number of what it is showing"
+    );
+
+    // The number a client reads back is the number switch_to_workspace takes.
+    let target = rows.iter().find(|row| row.index == 7).unwrap().id.clone();
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(7));
+    let active = reactor
+        .query_workspaces(None)
+        .into_iter()
+        .find(|row| row.is_active && row.id == target);
+    assert!(active.is_some(), "workspace 7 should be the active one on its display");
+}
+
+#[test]
+fn per_display_queries_keep_local_indices_when_shared_mode_is_off() {
+    let mut reactor = test_reactor_with_workspace_count(4);
+    let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+    reactor.handle_event(space_state_event(vec![left, right], vec![
+        Some(SpaceId::new(1)),
+        Some(SpaceId::new(2)),
+    ]));
+
+    let rows = reactor.query_workspaces(None);
+
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+        (0..4).collect::<Vec<_>>()
+    );
+}

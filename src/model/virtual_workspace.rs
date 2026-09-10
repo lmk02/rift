@@ -745,11 +745,16 @@ impl WorkspaceStore {
         name: Option<String>,
     ) -> Result<VirtualWorkspaceId, WorkspaceError> {
         self.ensure_space_initialized(space);
-        let count = self
-            .workspaces_by_space
-            .get(&space)
-            .map(|v: &Vec<VirtualWorkspaceId>| v.len())
-            .unwrap_or(0);
+        // The cap and the new workspace's ordinal are global in shared mode, because so
+        // is the namespace they belong to.
+        let count = if self.shared_across_displays {
+            self.ordered_workspace_ids_global().len()
+        } else {
+            self.workspaces_by_space
+                .get(&space)
+                .map(|v: &Vec<VirtualWorkspaceId>| v.len())
+                .unwrap_or(0)
+        };
         if count >= self.max_workspaces {
             return Err(WorkspaceError::InconsistentState(format!(
                 "Maximum workspace limit ({}) reached for space {:?}",
@@ -763,12 +768,7 @@ impl WorkspaceStore {
             name
         });
 
-        let idx = self
-            .workspaces_by_space
-            .get(&space)
-            .map(|v: &Vec<VirtualWorkspaceId>| v.len())
-            .unwrap_or(0);
-        let mode = self.resolve_layout_mode_for_workspace(idx, &name);
+        let mode = self.resolve_layout_mode_for_workspace(count, &name);
 
         let workspace = VirtualWorkspace::new(name, space, mode, &self.layout_settings);
         let workspace_id = self.workspaces.insert(workspace);
@@ -785,13 +785,17 @@ impl WorkspaceStore {
         self.active_workspace_per_space.get(&space).map(|tuple| tuple.1)
     }
 
+    /// Ordinal of the active workspace as a user would type it: global in shared mode,
+    /// per display otherwise. Broadcasts, the menu bar and IPC all report this, so it has
+    /// to agree with the number `switch_to_workspace` takes.
     pub fn active_workspace_idx(&self, space: SpaceId) -> Option<u64> {
-        self.active_workspace(space).and_then(|active_ws_id| {
-            self.ordered_workspace_ids(space)
-                .iter()
-                .position(|id| *id == active_ws_id)
-                .map(|idx| idx as u64)
-        })
+        let active = self.active_workspace(space)?;
+        let index = if self.shared_across_displays {
+            self.global_index_of(active)?
+        } else {
+            self.ordered_workspace_ids(space).iter().position(|id| *id == active)?
+        };
+        Some(index as u64)
     }
 
     pub fn workspace_auto_back_and_forth(&self) -> bool { self.workspace_auto_back_and_forth }

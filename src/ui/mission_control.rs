@@ -860,8 +860,11 @@ impl MissionControlOverlay {
                         None
                     } else {
                         let idx = idx.min(visible.len().saturating_sub(1));
-                        visible.get(idx).map(|(original_idx, _)| {
-                            MissionControlAction::SwitchToWorkspace(*original_idx)
+                        // The workspace's own reported index, not its position in the
+                        // list: in shared-across-displays mode that is the global number
+                        // `switch_to_workspace` takes.
+                        visible.get(idx).map(|(_, workspace)| {
+                            MissionControlAction::SwitchToWorkspace(workspace.index)
                         })
                     }
                 }
