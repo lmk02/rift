@@ -5618,3 +5618,233 @@ fn floating_window_toggles_to_fullscreen_within_gaps() {
         "expected {expected:?}, got {laid_out:?}"
     );
 }
+
+// ---- shared workspaces across displays -------------------------------------------------
+
+fn shared_workspace_settings(
+    count: usize,
+    first_on_right: usize,
+) -> crate::common::config::VirtualWorkspaceSettings {
+    crate::common::config::VirtualWorkspaceSettings {
+        shared_across_displays: true,
+        default_workspace_count: count,
+        workspace_names: Vec::new(),
+        workspace_display_assignment: (first_on_right..count)
+            .map(|index| crate::common::config::WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(index),
+                display: crate::common::config::DisplaySelector::Index(2),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// Two displays side by side with a shared pool split `first_on_right` / rest.
+/// Focus starts on the left display, which is what `workspace_command_space` reports.
+fn shared_two_display_reactor(count: usize, first_on_right: usize) -> (Reactor, SpaceId, SpaceId) {
+    let settings = shared_workspace_settings(count, first_on_right);
+    let mut reactor = test_reactor_with_workspace_settings(&settings);
+    reactor.config.virtual_workspaces = settings;
+
+    let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+    let left_space = SpaceId::new(1);
+    let right_space = SpaceId::new(2);
+    reactor.handle_event(space_state_event(vec![left, right], vec![
+        Some(left_space),
+        Some(right_space),
+    ]));
+    reactor.send_layout_event(LayoutEvent::SpaceExposed(left_space, left.size));
+    reactor.send_layout_event(LayoutEvent::SpaceExposed(right_space, right.size));
+    (reactor, left_space, right_space)
+}
+
+fn global_workspace(
+    reactor: &Reactor,
+    index: usize,
+) -> (crate::model::VirtualWorkspaceId, SpaceId) {
+    reactor
+        .layout_manager
+        .layout_engine
+        .virtual_workspace_manager()
+        .workspace_at_global_index(index)
+        .expect("global workspace index should resolve")
+}
+
+#[test]
+fn shared_mode_splits_the_pool_across_displays_by_assignment() {
+    let (reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+
+    assert_eq!(reactor.workspace_command_space(), Some(left_space));
+    for index in 0..5 {
+        assert_eq!(global_workspace(&reactor, index).1, left_space, "index {index}");
+    }
+    for index in 5..10 {
+        assert_eq!(global_workspace(&reactor, index).1, right_space, "index {index}");
+    }
+}
+
+#[test]
+fn switching_to_a_workspace_owned_by_another_display_activates_and_focuses_it() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let (target, _) = global_workspace(&reactor, 6);
+    let left_active_before = reactor.layout_manager.layout_engine.active_workspace(left_space);
+
+    let outcome = reactor.dispatch_test_layout_command(LayoutCommand::SwitchToWorkspace(6));
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(right_space),
+        Some(target),
+        "the workspace must activate on the display that owns it"
+    );
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(left_space),
+        left_active_before,
+        "the display we came from keeps showing what it was showing"
+    );
+    assert!(
+        !outcome.mouse_warps.is_empty(),
+        "focus must move to the other display, not stay under the cursor"
+    );
+    assert_eq!(
+        outcome.arrange.space_scope, None,
+        "both displays changed state, so the arrange pass must cover both"
+    );
+}
+
+#[test]
+fn switching_to_an_empty_workspace_on_another_display_still_moves_focus() {
+    let (mut reactor, _left_space, right_space) = shared_two_display_reactor(10, 5);
+    let right_screen = reactor
+        .space_state
+        .screen_by_space(right_space)
+        .expect("right display should be attached")
+        .frame;
+
+    // Nothing was ever added to workspace 6, so the layout response carries no focus
+    // window and `try_focus_or_warp_without_raise` would otherwise re-focus whatever sits
+    // under the cursor on the display we came from.
+    let outcome = reactor.dispatch_test_layout_command(LayoutCommand::SwitchToWorkspace(6));
+
+    assert_eq!(outcome.mouse_warps, vec![right_screen.mid()]);
+}
+
+#[test]
+fn switching_to_a_workspace_already_showing_on_another_display_only_moves_focus() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let right_active = reactor
+        .layout_manager
+        .layout_engine
+        .active_workspace(right_space)
+        .expect("the right display owns a workspace");
+    let already_showing = reactor
+        .layout_manager
+        .layout_engine
+        .virtual_workspace_manager()
+        .global_index_of(right_active)
+        .expect("its global index resolves");
+    let left_active_before = reactor.layout_manager.layout_engine.active_workspace(left_space);
+
+    let outcome =
+        reactor.dispatch_test_layout_command(LayoutCommand::SwitchToWorkspace(already_showing));
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(right_space),
+        Some(right_active),
+        "nothing to switch: it is already the active workspace there"
+    );
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(left_space),
+        left_active_before
+    );
+    assert!(
+        !outcome.mouse_warps.is_empty(),
+        "an already-active target still has to pull focus to its display"
+    );
+}
+
+#[test]
+fn next_workspace_crosses_the_display_boundary_and_respects_prevent_wrapping() {
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let (last_on_left, _) = global_workspace(&reactor, 4);
+    let (first_on_right, _) = global_workspace(&reactor, 5);
+    reactor.set_test_active_workspace(left_space, last_on_left);
+
+    reactor.handle_test_layout_command(LayoutCommand::NextWorkspace(None));
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(right_space),
+        Some(first_on_right),
+        "stepping past the last workspace of a display continues onto the next display"
+    );
+
+    // Now stand on the display that owns the last workspace in the namespace.
+    let (last_global, _) = global_workspace(&reactor, 9);
+    reactor.handle_event(Event::ActiveDisplayChanged {
+        menu_bar_space: Some(right_space),
+        command_space: Some(right_space),
+    });
+    assert!(reactor.set_test_active_workspace(right_space, last_global));
+
+    let mut settings = reactor.config.virtual_workspaces.clone();
+    settings.prevent_wrapping = true;
+    reactor
+        .layout_manager
+        .layout_engine
+        .update_virtual_workspace_settings(&reactor.state.windows, &settings);
+    reactor.config.virtual_workspaces = settings;
+
+    reactor.handle_test_layout_command(LayoutCommand::NextWorkspace(None));
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(right_space),
+        Some(last_global),
+        "prevent_wrapping stops at the end of the global namespace"
+    );
+
+    // Without it, the same step wraps to the very first workspace, on the other display.
+    let mut settings = reactor.config.virtual_workspaces.clone();
+    settings.prevent_wrapping = false;
+    reactor
+        .layout_manager
+        .layout_engine
+        .update_virtual_workspace_settings(&reactor.state.windows, &settings);
+    reactor.config.virtual_workspaces = settings;
+
+    reactor.handle_test_layout_command(LayoutCommand::NextWorkspace(None));
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(left_space),
+        Some(global_workspace(&reactor, 0).0),
+        "wrapping wraps the whole namespace, back onto the first display"
+    );
+}
+
+#[test]
+fn workspace_switching_stays_per_display_when_shared_mode_is_off() {
+    let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+    let left_space = SpaceId::new(1);
+    let right_space = SpaceId::new(2);
+    let mut reactor = test_reactor_with_workspace_count(4);
+    reactor.handle_event(space_state_event(vec![left, right], vec![
+        Some(left_space),
+        Some(right_space),
+    ]));
+    reactor.send_layout_event(LayoutEvent::SpaceExposed(left_space, left.size));
+    reactor.send_layout_event(LayoutEvent::SpaceExposed(right_space, right.size));
+    let right_active_before = reactor.layout_manager.layout_engine.active_workspace(right_space);
+    let left_target = reactor.test_workspace(left_space, 2);
+
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(2));
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(left_space),
+        Some(left_target),
+        "index 2 must still mean the focused display's third workspace"
+    );
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace(right_space),
+        right_active_before
+    );
+}

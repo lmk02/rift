@@ -384,6 +384,10 @@ impl WorkspaceStore {
 
     pub fn last_active_global(&self) -> Option<VirtualWorkspaceId> { self.last_active_global }
 
+    pub fn workspace_space(&self, workspace_id: VirtualWorkspaceId) -> Option<SpaceId> {
+        self.workspaces.get(workspace_id).map(|workspace| workspace.space)
+    }
+
     /// Moves workspace ownership between spaces: the workspace record, both
     /// `workspaces_by_space` entries, the active/previous slots on either side, and every
     /// member window's composite `WindowWorkspaceInfo` key — which is what keeps

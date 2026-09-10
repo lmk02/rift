@@ -1903,12 +1903,31 @@ impl Reactor {
                     },
                 );
             }
-            Event::Command(Command::Layout(command)) => {
+            Event::Command(Command::Layout(mut command)) => {
                 let post_arrange_mouse_warp =
                     self.config.settings.mouse_follows_focus.then(|| self.main_window()).flatten();
-                let command_space = self.command_context_space();
+                let mut command_space = self.command_context_space();
+                let mut focus_display_space = None;
+                match self.resolve_shared_workspace_command(&command, command_space) {
+                    SharedRetarget::Unchanged => {}
+                    SharedRetarget::FocusOnly { space } => {
+                        // The target workspace is already showing on the other display, so
+                        // the layout command would report no change and focus would never
+                        // move. A focus move is the whole point of the keypress.
+                        return self.focus_display_outcome(space);
+                    }
+                    SharedRetarget::Retargeted {
+                        command: retargeted,
+                        space,
+                        crossed_displays,
+                    } => {
+                        command = retargeted;
+                        command_space = Some(space);
+                        focus_display_space = crossed_displays.then_some(space);
+                    }
+                }
                 let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(false);
-                return command_workflow::handle_command_layout(
+                let mut outcome = command_workflow::handle_command_layout(
                     &mut self.state,
                     &mut self.layout_manager,
                     &mut self.workspace_switch_manager,
@@ -1919,7 +1938,18 @@ impl Reactor {
                         visible_space_centers,
                         post_arrange_mouse_warp,
                     },
-                );
+                )?;
+                if let Some(space) = focus_display_space {
+                    // Both displays changed state, so a scope of one space would leave the
+                    // other one's windows parked where they were.
+                    outcome = outcome.with_arrange_space_scope(None);
+                    // Computed after the layout command has run, so it sees the workspace
+                    // that was just activated. Absorbed last: raises and warps drain after
+                    // the arrange pass, so focus lands on arranged windows rather than on
+                    // their offscreen park coordinates.
+                    outcome.absorb(self.focus_display_outcome(space)?);
+                }
+                return Ok(outcome);
             }
             Event::Command(Command::Reactor(ReactorCommand::MoveWindowToDisplay {
                 selector,
@@ -2780,6 +2810,7 @@ impl Reactor {
                 .layout_engine
                 .update_space_display(space, Some(display_uuid.to_string()));
         }
+        self.apply_shared_workspace_topology();
         let current_screens = self.screens_for_current_spaces();
         self.space_activation_policy
             .on_spaces_updated(activation_config, &current_screens);
@@ -4825,6 +4856,118 @@ impl Reactor {
         screens
     }
 
+    /// How a workspace command was rewritten for shared-across-displays mode.
+    fn resolve_shared_workspace_command(
+        &mut self,
+        command: &layout::LayoutCommand,
+        command_space: Option<SpaceId>,
+    ) -> SharedRetarget {
+        if !self.config.virtual_workspaces.shared_across_displays {
+            return SharedRetarget::Unchanged;
+        }
+        let Some(command_space) = command_space else {
+            return SharedRetarget::Unchanged;
+        };
+
+        let workspaces = self.layout_manager.layout_engine.virtual_workspace_manager();
+        let target = match command {
+            layout::LayoutCommand::SwitchToWorkspace(index) => {
+                workspaces.workspace_at_global_index(*index)
+            }
+            layout::LayoutCommand::NextWorkspace(skip_empty) => workspaces
+                .active_workspace(command_space)
+                .and_then(|current| {
+                    workspaces.step_workspace_global(
+                        &self.state.windows,
+                        current,
+                        *skip_empty,
+                        Direction::Right,
+                    )
+                }),
+            layout::LayoutCommand::PrevWorkspace(skip_empty) => workspaces
+                .active_workspace(command_space)
+                .and_then(|current| {
+                    workspaces.step_workspace_global(
+                        &self.state.windows,
+                        current,
+                        *skip_empty,
+                        Direction::Left,
+                    )
+                }),
+            layout::LayoutCommand::SwitchToLastWorkspace => workspaces
+                .last_active_global()
+                .and_then(|id| Some((id, workspaces.workspace_space(id)?))),
+            _ => None,
+        };
+
+        let Some((workspace, space)) = target else {
+            return SharedRetarget::Unchanged;
+        };
+        if !self.is_space_active(space) {
+            warn!(?space, ?workspace, "Workspace command ignored: its display is inactive");
+            return SharedRetarget::Unchanged;
+        }
+        let crossed_displays = space != command_space;
+        if crossed_displays && workspaces.active_workspace(space) == Some(workspace) {
+            return SharedRetarget::FocusOnly { space };
+        }
+        let Some(local_index) = workspaces.local_index_of(space, workspace) else {
+            return SharedRetarget::Unchanged;
+        };
+        SharedRetarget::Retargeted {
+            command: layout::LayoutCommand::SwitchToWorkspace(local_index),
+            space,
+            crossed_displays,
+        }
+    }
+
+    /// Moves keyboard focus and the cursor onto `space`'s display, reusing the same
+    /// machinery as `ReactorCommand::FocusDisplay`. The warp is unconditional: with
+    /// `focus_follows_mouse` on, leaving the cursor on the display we came from bounces
+    /// focus straight back.
+    fn focus_display_outcome(&mut self, space: SpaceId) -> anyhow::Result<EventOutcome> {
+        let screen = self.space_state.screen_by_space(space).cloned();
+        let focus_window = self.last_focused_window_in_space(space).or_else(|| {
+            self.layout_manager
+                .layout_engine
+                .windows_in_active_workspace(&self.state.windows, space)
+                .into_iter()
+                .next()
+        });
+        let focus_window_center = focus_window
+            .and_then(|wid| self.state.windows.window(wid))
+            .map(|window| window.frame_monotonic.mid());
+        command_workflow::handle_focus_display(
+            &self.app_manager,
+            command_workflow::DisplayFocusPayload {
+                screen,
+                target_is_active: self.is_space_active(space),
+                focus_window,
+                focus_window_center,
+            },
+        )
+    }
+
+    /// Reconciles the shared workspace pool with the attached displays. No-op unless
+    /// `shared_across_displays` is on. Must run after `remap_space` so it sees post-churn
+    /// space ids, and after `update_space_display` so display UUIDs are current.
+    fn apply_shared_workspace_topology(&mut self) {
+        if !self.config.virtual_workspaces.shared_across_displays {
+            return;
+        }
+        let visible: Vec<(SpaceId, Option<String>)> = self
+            .screens_in_physical_order()
+            .into_iter()
+            .filter_map(|screen| {
+                Some((screen.space?, screen.display_uuid_opt().map(str::to_string)))
+            })
+            .collect();
+        self.layout_manager
+            .layout_engine
+            .virtual_workspace_manager_mut()
+            .apply_display_topology(&mut self.state.windows, &visible);
+    }
+
     fn store_current_floating_positions(&mut self, space: SpaceId) {
         let floating_windows_in_workspace = self
             .layout_manager
@@ -4874,4 +5017,18 @@ impl Reactor {
                 false
             })
     }
+}
+
+/// Outcome of resolving a workspace command against the shared global namespace.
+enum SharedRetarget {
+    /// Shared mode is off, or the target already lives on the current display.
+    Unchanged,
+    /// Rewritten to a display-local index; run it against `space`.
+    Retargeted {
+        command: layout::LayoutCommand,
+        space: SpaceId,
+        crossed_displays: bool,
+    },
+    /// The target workspace is already active on another display; only focus must move.
+    FocusOnly { space: SpaceId },
 }
