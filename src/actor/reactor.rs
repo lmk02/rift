@@ -3281,6 +3281,21 @@ impl Reactor {
             return self.restore_window_to_active_layout_if_visible(wid, authoritative_space);
         }
 
+        // Our own frame write for this window is still unconfirmed, so a snapshot naming the
+        // display it came from is lagging rather than authoritative: `resolve_native_space`
+        // hands back the stale origin whenever the live WindowServer query still agrees with
+        // it, which is exactly the case while an AX write is in flight. Acting on that
+        // re-homes the window onto the display it just left, and the arrange that follows
+        // rewrites its siblings' frames - which is how moving a workspace full of windows
+        // twitches between displays until every write happens to settle.
+        if let Some(window_server_id) = self.state.windows.window(wid).and_then(|w| w.info.sys_id)
+            && self
+                .pending_target_space_for_window_server_id(window_server_id)
+                .is_some_and(|pending| pending != authoritative_space)
+        {
+            return false;
+        }
+
         self.send_layout_event(LayoutEvent::WindowRemovedPreserveFloating(wid));
 
         let _ = self

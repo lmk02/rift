@@ -6258,3 +6258,41 @@ fn cycling_display_selector_also_wraps_for_window_moves_and_focus() {
         outcome.mouse_warps
     );
 }
+
+#[test]
+fn an_unconfirmed_move_is_not_undone_by_a_snapshot_that_has_not_caught_up() {
+    // Moving a workspace across displays writes each window's frame through AX, which is
+    // async. Until macOS applies it, both the snapshot and the live WindowServer query
+    // still report the old display - and `resolve_native_space` prefers the observation
+    // whenever the live query agrees with it, discarding the pending target. Acting on
+    // that drags the window back into the old display's *visible* workspace, whose arrange
+    // pass rewrites its siblings' frames, which is what makes a multi-window workspace
+    // twitch between displays.
+    let (mut reactor, left_space, right_space) = shared_two_display_reactor(10, 5);
+    let window = seed_window_on_left(&mut reactor, left_space);
+    let workspace = reactor.layout_manager.layout_engine.active_workspace(left_space).unwrap();
+
+    reactor.handle_event(Event::Command(crate::model::reactor::Command::Reactor(
+        crate::model::reactor::ReactorCommand::MoveWorkspaceToDisplay {
+            selector: DisplaySelector::Index(1),
+            workspace: None,
+        },
+    )));
+    assert_eq!(
+        reactor.state.windows.workspace_info_for_window(window).map(|info| info.space),
+        Some(right_space),
+        "precondition: the move landed"
+    );
+
+    reactor.reassign_window_to_authoritative_space_preserving_workspace_ordinal(
+        window,
+        left_space,
+    );
+
+    let assignment = reactor.state.windows.workspace_info_for_window(window).unwrap();
+    assert_eq!(
+        assignment.space, right_space,
+        "an unconfirmed move must not be undone by a lagging snapshot"
+    );
+    assert_eq!(assignment.workspace_id, workspace, "and it stays in its own workspace");
+}
