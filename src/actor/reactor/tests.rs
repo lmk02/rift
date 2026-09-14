@@ -6296,3 +6296,43 @@ fn an_unconfirmed_move_is_not_undone_by_a_snapshot_that_has_not_caught_up() {
     );
     assert_eq!(assignment.workspace_id, workspace, "and it stays in its own workspace");
 }
+
+#[test]
+fn dragging_a_floating_window_across_displays_keeps_it_floating() {
+    // Dropping a drag on a different space emits WindowRemoved, which clears the global
+    // floating flag, and then WindowAdded - by which point the window no longer looks
+    // floating and gets inserted into the tiling tree. The keyboard path preserves it
+    // explicitly, which is why only mouse moves tile a float.
+    let (mut reactor, wid, _wsid, space1, space2, initial_frame, screen2) =
+        reactor_with_window_on_space1_two_displays();
+
+    reactor.send_layout_event(LayoutEvent::WindowAdded(space1, wid));
+    reactor.send_layout_event(LayoutEvent::WindowFocused(space1, wid));
+    reactor.handle_test_layout_command(LayoutCommand::ToggleWindowFloating);
+    assert!(reactor.layout_manager.layout_engine.is_window_floating(wid));
+
+    let moved_frame = CGRect::new(
+        CGPoint::new(screen2.origin.x + 120.0, initial_frame.origin.y),
+        initial_frame.size,
+    );
+    reactor.drag_manager.drag_state = DragState::Active {
+        session: DragSession {
+            window: wid,
+            last_frame: moved_frame,
+            // The real drag path knows where the window started; only then is the
+            // WindowRemoved emitted.
+            origin_space: Some(space1),
+            settled_space: Some(space2),
+            layout_dirty: true,
+        },
+    };
+
+    // Through the real event path, so the emitted layout events are actually applied.
+    reactor.handle_event(Event::MouseUp);
+
+    assert_eq!(reactor.assigned_space_for_window_id(wid), Some(space2));
+    assert!(
+        reactor.layout_manager.layout_engine.is_window_floating(wid),
+        "a floating window dragged to another display must not become tiled"
+    );
+}

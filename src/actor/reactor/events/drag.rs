@@ -52,7 +52,12 @@ pub fn handle_mouse_up(
         let window = session.window;
         if session.origin_space != payload.final_space {
             if session.origin_space.is_some() {
-                outcome = outcome.with_layout_event(LayoutEvent::WindowRemoved(window));
+                // Preserve floating: a plain WindowRemoved clears the global floating flag,
+                // so the WindowAdded below no longer sees a float and tiles it. Dragging a
+                // floating window to another display must leave it floating, exactly as the
+                // keyboard path through `move_window_to_space` does.
+                outcome =
+                    outcome.with_layout_event(LayoutEvent::WindowRemovedPreserveFloating(window));
             }
             if let Some(space) = payload.final_space {
                 if state.windows.window(window).is_some_and(WindowState::is_admitted) {
