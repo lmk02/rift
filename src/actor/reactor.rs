@@ -5302,10 +5302,15 @@ impl Reactor {
                 Some((screen.space?, screen.display_uuid_opt().map(str::to_string)))
             })
             .collect();
+        // A display in native fullscreen has its space nulled, so it drops out of
+        // `visible` while still being attached. Its last user space is retained so its
+        // workspaces are not treated as stranded and re-homed.
+        let retained: Vec<SpaceId> =
+            self.space_state.last_user_space_by_display.values().copied().collect();
         self.layout_manager
             .layout_engine
             .virtual_workspace_manager_mut()
-            .apply_display_topology(&mut self.state.windows, &visible);
+            .apply_display_topology(&mut self.state.windows, &visible, &retained);
     }
 
     fn store_current_floating_positions(&mut self, space: SpaceId) {

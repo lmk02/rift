@@ -436,12 +436,17 @@ impl WorkspaceStore {
 
     /// Reconciles the global workspace pool with the live display topology.
     ///
-    /// `visible` is every attached display's current space, in physical order. Shared mode
-    /// only; a no-op otherwise. Runs after `remap_space` so it sees post-churn space ids.
+    /// `visible` is every attached display's current space, in physical order. `retained`
+    /// names spaces that still belong to an attached display even though they are not
+    /// visible right now - a display in native fullscreen has its space nulled, and
+    /// treating that as "the display is gone" would re-home its workspaces and collapse
+    /// the configured split. Shared mode only; a no-op otherwise. Runs after `remap_space`
+    /// so it sees post-churn space ids.
     pub fn apply_display_topology(
         &mut self,
         window_store: &mut WindowStore,
         visible: &[(SpaceId, Option<String>)],
+        retained: &[SpaceId],
     ) {
         if !self.shared_across_displays {
             return;
@@ -457,17 +462,19 @@ impl WorkspaceStore {
             let index = self.ordered_workspace_ids_global().len();
             self.push_default_workspace(home, index);
         }
-        self.active_workspace_per_space.entry(home).or_insert_with(|| {
-            let default = self
-                .workspaces_by_space
-                .get(&home)
-                .and_then(|ids| ids.get(self.default_workspace).or_else(|| ids.first()))
-                .copied();
-            (None, default.expect("pool was just created on this space"))
-        });
+        // Only meaningful when the pool was just created here. `home` can own nothing -
+        // a fullscreen transition nulls a display's space, so a space that owns no
+        // workspaces can become the first one in physical order while the pool is already
+        // full. `ensure_every_display_owns_a_workspace` below settles that case.
+        let owned_by_home = self.ordered_workspace_ids(home);
+        if let Some(default) =
+            owned_by_home.get(self.default_workspace).or_else(|| owned_by_home.first()).copied()
+        {
+            self.active_workspace_per_space.entry(home).or_insert((None, default));
+        }
 
         self.apply_display_assignment(window_store, visible);
-        self.rehome_detached_workspaces(window_store, home, visible);
+        self.rehome_detached_workspaces(window_store, home, visible, retained);
         self.ensure_every_display_owns_a_workspace(window_store, visible);
     }
 
@@ -508,12 +515,14 @@ impl WorkspaceStore {
         window_store: &mut WindowStore,
         home: SpaceId,
         visible: &[(SpaceId, Option<String>)],
+        retained: &[SpaceId],
     ) {
         let detached: Vec<SpaceId> = self
             .workspaces_by_space
             .keys()
             .copied()
             .filter(|space| !visible.iter().any(|(visible, _)| visible == space))
+            .filter(|space| !retained.contains(space))
             .collect();
         for space in detached {
             for workspace in self.ordered_workspace_ids(space) {
@@ -531,10 +540,9 @@ impl WorkspaceStore {
     ) {
         for &(space, _) in visible {
             if !self.ordered_workspace_ids(space).is_empty() {
-                self.active_workspace_per_space.entry(space).or_insert_with(|| {
-                    let first = self.workspaces_by_space[&space][0];
-                    (None, first)
-                });
+                if let Some(first) = self.ordered_workspace_ids(space).first().copied() {
+                    self.active_workspace_per_space.entry(space).or_insert((None, first));
+                }
                 continue;
             }
             let donor = self
@@ -1623,13 +1631,63 @@ mod tests {
     }
 
     #[test]
+    fn a_display_that_owns_no_workspaces_does_not_panic_when_the_pool_is_full() {
+        // Entering or leaving native fullscreen nulls a display's space and can make a
+        // different space the first one in physical order. That space owns nothing, and
+        // the global pool is already full, so nothing is created for it either.
+        let mut store = shared_store(4);
+        let mut windows = WindowStore::default();
+        let first = SpaceId::new(1);
+        store.apply_display_topology(&mut windows, &[(first, None)], &[]);
+        assert_eq!(store.ordered_workspace_ids_global().len(), 4);
+
+        let newcomer = SpaceId::new(2);
+        store.apply_display_topology(&mut windows, &[(newcomer, None)], &[]);
+
+        assert_eq!(store.ordered_workspace_ids_global().len(), 4, "the pool is unchanged");
+        assert!(
+            store.active_workspace(newcomer).is_some(),
+            "the visible display still has to be showing something"
+        );
+    }
+
+    #[test]
+    fn a_display_in_fullscreen_does_not_lose_its_workspaces() {
+        // While a display is in native fullscreen its `screen.space` is nulled, so it is
+        // absent from the visible list. That is not the same as the display being gone,
+        // and re-homing its workspaces would collapse the configured split.
+        let mut store = shared_store(10);
+        store.display_assignment = (5..10)
+            .map(|index| WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(index),
+                display: DisplaySelector::Index(1),
+            })
+            .collect();
+        let mut windows = WindowStore::default();
+        let left = SpaceId::new(1);
+        let right = SpaceId::new(2);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
+        assert_eq!(store.ordered_workspace_ids(left).len(), 5);
+
+        // Left enters fullscreen: still attached, but its user space is not visible.
+        store.apply_display_topology(&mut windows, &[(right, None)], &[left]);
+
+        assert_eq!(
+            store.ordered_workspace_ids(left).len(),
+            5,
+            "a display that is merely in fullscreen must keep its workspaces"
+        );
+        assert_eq!(store.workspace_at_global_index(0).map(|(_, space)| space), Some(left));
+    }
+
+    #[test]
     fn shared_mode_creates_one_global_pool_not_one_set_per_display() {
         let mut store = shared_store(6);
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
 
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
 
         assert_eq!(store.ordered_workspace_ids_global().len(), 6);
         assert_eq!(
@@ -1661,7 +1719,7 @@ mod tests {
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
 
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
 
         let (workspace, owner) = store.workspace_at_global_index(4).unwrap();
         assert_eq!(owner, right);
@@ -1677,7 +1735,7 @@ mod tests {
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
 
         let (workspace, owner) = store.workspace_at_global_index(0).unwrap();
         assert_eq!(owner, left);
@@ -1710,10 +1768,10 @@ mod tests {
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
         let (stranded, _) = store.workspace_at_global_index(5).unwrap();
 
-        store.apply_display_topology(&mut windows, &[(left, None)]);
+        store.apply_display_topology(&mut windows, &[(left, None)], &[]);
 
         assert_eq!(store.workspace_at_global_index(5), Some((stranded, left)));
         assert_eq!(store.ordered_workspace_ids_global().len(), 6);
@@ -1736,7 +1794,7 @@ mod tests {
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
 
         let last_on_left = store.workspace_at_global_index(1).unwrap().0;
         assert_eq!(
@@ -1785,7 +1843,7 @@ mod tests {
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)]);
+        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
         let (third, owner) = store.workspace_at_global_index(2).unwrap();
         assert_eq!(owner, left);
 
