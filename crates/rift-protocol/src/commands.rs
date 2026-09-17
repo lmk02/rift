@@ -118,9 +118,17 @@ pub enum ReactorCommand {
     },
     /// Hands ownership of a workspace to another display. `workspace` is a global index;
     /// omitted means the workspace the focused display is showing.
+    ///
+    /// Outside shared mode, workspaces are display-local, so windows move into the
+    /// destination display's workspace at the same ordinal and that workspace becomes
+    /// active.
     MoveWorkspaceToDisplay {
         selector: DisplaySelector,
         workspace: Option<usize>,
+        /// Continue from the opposite edge when a directional selector has no
+        /// display further in that direction.
+        #[serde(default)]
+        wrap_around: bool,
     },
 }
 

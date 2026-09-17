@@ -66,7 +66,9 @@ mod tests;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use animation::Sender as AnimationSender;
 use events::{
@@ -83,7 +85,7 @@ use serde_with::serde_as;
 use tracing::{debug, instrument, trace, warn};
 use transaction_manager::TransactionId;
 
-use super::{event_tap, gesture_tap};
+use super::input;
 use crate::actor::app::{
     AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, WindowInventoryToken, pid_t,
 };
@@ -111,7 +113,6 @@ use crate::sys::window_server::{
 
 pub type Sender = actor::Sender<Event>;
 type Receiver = actor::Receiver<Event>;
-use managers::RefreshQuarantineState;
 pub use query::ReactorQueryHandle;
 
 pub(crate) use crate::model::reactor::{AppState, WindowState};
@@ -120,6 +121,61 @@ pub use crate::model::reactor::{
     ReactorCommand, RefocusState, Requested, StaleCleanupState, WorkspaceSwitchOrigin,
     WorkspaceSwitchState,
 };
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct MouseFocusPublisher(Arc<MouseFocusState>);
+
+#[derive(Debug, Default)]
+struct MouseFocusState {
+    latest: parking_lot::Mutex<Option<CGPoint>>,
+}
+
+impl MouseFocusPublisher {
+    pub(crate) fn publish(
+        &self,
+        sender: &Sender,
+        point: CGPoint,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<(tracing::Span, Event)>> {
+        let mut latest = self.0.latest.lock();
+        let needs_wake = latest.is_none();
+        *latest = Some(point);
+        if !needs_wake {
+            return Ok(());
+        }
+        sender.try_send(Event::MouseFocusPending(self.clone())).inspect_err(|_| {
+            *latest = None;
+        })
+    }
+
+    fn take_latest(&self) -> Option<CGPoint> { self.0.latest.lock().take() }
+}
+
+#[cfg(test)]
+mod mouse_focus_publisher_tests {
+    use super::*;
+
+    #[test]
+    fn replaces_pending_focus_candidate_and_queues_one_wake() {
+        let (sender, mut receiver) = actor::channel();
+        let publisher = MouseFocusPublisher::default();
+        for x in [123.0, 456.0, 789.0] {
+            publisher.publish(&sender, CGPoint::new(x, 10.0)).unwrap();
+        }
+
+        let (_, Event::MouseFocusPending(wake)) = receiver.try_recv().unwrap() else {
+            panic!("expected coalesced mouse-focus wake");
+        };
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(wake.take_latest(), Some(CGPoint::new(789.0, 10.0)));
+        // The same position must be reconsidered after inventory/focus changes.
+        publisher.publish(&sender, CGPoint::new(789.0, 10.0)).unwrap();
+        let (_, Event::MouseFocusPending(wake)) = receiver.try_recv().unwrap() else {
+            panic!("expected another wake for a stationary hover");
+        };
+        assert_eq!(wake.take_latest(), Some(CGPoint::new(789.0, 10.0)));
+    }
+}
 
 #[derive(Clone)]
 pub struct ReactorHandle {
@@ -186,6 +242,8 @@ pub enum Event {
     },
     ApplicationTerminated(pid_t),
     ApplicationThreadTerminated(pid_t),
+    #[serde(skip)]
+    AppActorExited(pid_t, AppThreadHandle),
     ApplicationActivated(pid_t, Quiet),
     ApplicationDeactivated(pid_t),
     ApplicationGloballyActivated(pid_t),
@@ -259,10 +317,11 @@ pub enum Event {
     /// FIXME: This can be interleaved incorrectly with the MouseState in app
     /// actor events.
     MouseUp,
-    /// Sent by the event tap only when the cursor enters a different window.
-    /// Window resolution and transition deduplication stay on the input
-    /// thread; the reactor only applies the model-dependent focus/raise work.
+    /// A hover resolved by the reactor from the latest input position.
     MouseMoved(WindowServerId),
+    /// Coalesced wake for the latest pointer position from the input thread.
+    #[serde(skip)]
+    MouseFocusPending(MouseFocusPublisher),
     /// Forwarded by the spaces actor after wake has been observed.
     ///
     /// The spaces actor is the authority for sleep/lock/display lifecycle.
@@ -333,6 +392,7 @@ pub struct Reactor {
     space_state: ForwardedSpaceState,
     space_activation_policy: SpaceActivationPolicy,
     main_window_tracker: MainWindowTracker,
+    pending_mouse_focus: Option<(WindowId, Instant)>,
     drag_manager: managers::DragManager,
     workspace_switch_manager: managers::WorkspaceSwitchManager,
     recording_manager: managers::RecordingManager,
@@ -356,12 +416,11 @@ impl Reactor {
         config: Config,
         layout_engine: LayoutEngine,
         record: Record,
-        event_tap_tx: event_tap::Sender,
+        input_tx: input::Sender,
         broadcast_tx: BroadcastSender,
         menu_tx: menu_bar::Sender,
         stack_line_tx: stack_line::Sender,
         window_notify: Option<(crate::actor::window_notify::Sender, WindowTxStore)>,
-        gesture_tap_tx: Option<gesture_tap::Sender>,
         one_space: bool,
     ) -> ReactorHandle {
         let (events_tx, events) = actor::channel();
@@ -374,10 +433,9 @@ impl Reactor {
             window_notify,
             one_space,
         );
-        reactor.communication_manager.event_tap_tx = Some(event_tap_tx);
+        reactor.communication_manager.input_tx = Some(input_tx);
         reactor.menu_manager.menu_tx = Some(menu_tx);
         reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
-        reactor.communication_manager.gesture_tap_tx = gesture_tap_tx;
         reactor.communication_manager.events_tx = Some(events_tx_clone.clone());
         let query_handle = ReactorQueryHandle::new(events_tx_clone.clone());
         thread::Builder::new()
@@ -413,6 +471,7 @@ impl Reactor {
             space_state: ForwardedSpaceState::default(),
             space_activation_policy: SpaceActivationPolicy::new(),
             main_window_tracker: MainWindowTracker::default(),
+            pending_mouse_focus: None,
             drag_manager: managers::DragManager {
                 drag_state: DragState::Inactive,
                 drag_swap_manager: crate::actor::drag_swap::DragManager::new(
@@ -429,8 +488,7 @@ impl Reactor {
             },
             recording_manager: managers::RecordingManager { record },
             communication_manager: managers::CommunicationManager {
-                event_tap_tx: None,
-                gesture_tap_tx: None,
+                input_tx: None,
                 stack_line_tx: None,
                 raise_manager_tx,
                 event_broadcaster: broadcast_tx,
@@ -590,8 +648,6 @@ impl Reactor {
             one_space: self.one_space,
         }
     }
-
-    fn screens_for_current_spaces(&self) -> Vec<ScreenInfo> { self.space_state.screens.clone() }
 
     fn display_uuids_for_current_screens(&self) -> Vec<Option<String>> {
         self.space_state
@@ -940,14 +996,14 @@ impl Reactor {
         let (raise_manager_tx, raise_manager_rx) = actor::channel();
         let (animation_tx, animation_rx) = tokio::sync::mpsc::unbounded_channel();
         let reactor = Rc::new(RefCell::new(reactor));
-        let event_tap_tx = {
+        let input_tx = {
             let mut reactor = reactor.borrow_mut();
             reactor.communication_manager.raise_manager_tx = raise_manager_tx.clone();
             reactor.animation_tx = Some(animation_tx);
-            reactor.communication_manager.event_tap_tx.clone()
+            reactor.communication_manager.input_tx.clone()
         };
         let reactor_task = Self::run_reactor_loop(reactor, events);
-        let raise_manager_task = RaiseManager::run(raise_manager_rx, events_tx, event_tap_tx);
+        let raise_manager_task = RaiseManager::run(raise_manager_rx, events_tx, input_tx);
         let animation_task = animation::AnimationManager::run(animation_rx);
         let _ = tokio::join!(reactor_task, raise_manager_task, animation_task);
     }
@@ -972,6 +1028,17 @@ impl Reactor {
     fn handle_thread_event(reactor: &Rc<RefCell<Reactor>>, event: Event) {
         match event {
             Event::InstallIpc(request) => crate::ipc::install_mach_server(reactor.clone(), request),
+            Event::MouseFocusPending(publisher) => {
+                if let Some(point) = publisher.take_latest() {
+                    // Resolve against WindowServer when processing the latest position,
+                    // rather than preserving an ID from an earlier input callback.
+                    if let Some(window) = window_server::get_window_at_point(point) {
+                        reactor.borrow_mut().handle_loop_event(Event::MouseMoved(window));
+                    } else {
+                        trace!(?point, "No window at mouse position");
+                    }
+                }
+            }
             event => reactor.borrow_mut().handle_loop_event(event),
         }
     }
@@ -981,8 +1048,19 @@ impl Reactor {
             self.handle_query_request(req);
             return;
         }
+        if let Event::MouseMoved(wsid) = &event {
+            self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input = false;
+            if let Some(window) = self.state.windows.tracked_window_id(*wsid)
+                && self.main_window() == Some(window)
+                && self.layout_manager.layout_engine.focused_window() == Some(window)
+            {
+                // Keep hit testing live, but avoid native space/stack queries and
+                // outcome processing when actual focus already matches the hit.
+                return;
+            }
+        }
         if self.should_quarantine_space_lifecycle_event(&event) {
-            trace!(?event, state = ?self.refresh_quarantine_state(), "quarantined space lifecycle event");
+            trace!(?event, state = ?self.refresh_quarantine_manager.state(), "quarantined space lifecycle event");
             return;
         }
         if self.should_quarantine_during_display_churn(&event) {
@@ -1068,10 +1146,6 @@ impl Reactor {
             && matches!(event, Event::SpaceCreated(..) | Event::SpaceDestroyed(..))
     }
 
-    fn refresh_quarantine_state(&self) -> RefreshQuarantineState {
-        self.refresh_quarantine_manager.state()
-    }
-
     fn refreshes_blocked(&self) -> bool { self.refresh_quarantine_manager.blocks_refreshes() }
 
     fn defer_window_inventory_refresh(&mut self) {
@@ -1118,6 +1192,7 @@ impl Reactor {
 
     #[instrument(name = "reactor::handle_event", skip(self), fields(event=?event))]
     fn handle_event(&mut self, event: Event) {
+        let was_dragging = !matches!(self.drag_manager.drag_state, DragState::Inactive);
         let previously_focused_window = self.main_window();
         match self.dispatch_workflow(event) {
             Ok(mut outcome) => {
@@ -1131,9 +1206,21 @@ impl Reactor {
             }
             Err(error) => warn!(%error, "reactor workflow failed"),
         }
+        let dragging = !matches!(self.drag_manager.drag_state, DragState::Inactive);
+        if dragging != was_dragging
+            && let Some(tx) = &self.communication_manager.input_tx
+        {
+            tx.send(input::Request::SetDragActive(dragging));
+        }
     }
 
-    fn dispatch_workflow(&mut self, event: Event) -> anyhow::Result<EventOutcome> {
+    fn dispatch_workflow(&mut self, mut event: Event) -> anyhow::Result<EventOutcome> {
+        if let Event::AppActorExited(pid, handle) = &event {
+            if !self.app_manager.apps.get(pid).is_some_and(|app| app.handle.same_actor(handle)) {
+                return Ok(EventOutcome::no_change());
+            }
+            event = Event::ApplicationThreadTerminated(*pid);
+        }
         self.log_event(&event);
         self.recording_manager.record.on_event(&event);
 
@@ -1189,6 +1276,13 @@ impl Reactor {
             Event::ApplicationGloballyActivated(pid)
                 if self.main_window_tracker.is_globally_frontmost(*pid)
         );
+
+        // Reject before updating focus or inventory state.
+        if let Event::ApplicationLaunched { pid, handle, .. } = &event
+            && self.app_manager.reject_duplicate(*pid, handle)
+        {
+            return Ok(EventOutcome::no_change());
+        }
 
         let raised_window = self.main_window_tracker.handle_event(&event);
         match event {
@@ -1264,8 +1358,8 @@ impl Reactor {
             }
             Event::WindowServerFocusChanged(window, reported_space) => {
                 if self.layout_manager.layout_engine.focused_window() == Some(window) {
-                    if let Some(event_tap_tx) = &self.communication_manager.event_tap_tx {
-                        _ = event_tap_tx.send(crate::actor::event_tap::Request::EnforceHidden);
+                    if let Some(input_tx) = &self.communication_manager.input_tx {
+                        _ = input_tx.send(crate::actor::input::Request::EnforceHidden);
                     }
                     return Ok(EventOutcome::default());
                 }
@@ -1672,6 +1766,27 @@ impl Reactor {
             }
             Event::MouseMoved(wsid) => {
                 let window = self.state.windows.tracked_window_id(wsid);
+                if window.is_some_and(|window| {
+                    self.pending_mouse_focus.is_some_and(|(pending, started)| {
+                        pending == window && started.elapsed() < Duration::from_secs(1)
+                    })
+                }) {
+                    return Ok(EventOutcome::default());
+                }
+                if window.is_none() {
+                    trace!(?wsid, "Mouse hit window missing from inventory");
+                    if let Some(info) = self
+                        .state
+                        .windows
+                        .get_window_server_info(wsid)
+                        .or_else(|| window_server::get_window(wsid))
+                        && info.layer == 0
+                        && !self.window_inventory_manager.in_flight.contains_key(&info.pid)
+                    {
+                        self.request_window_inventory(info.pid);
+                    }
+                    return Ok(EventOutcome::default());
+                }
                 let active_space = window.and_then(|window| {
                     self.state.windows.window(window).and_then(|state| {
                         self.best_space_for_window(&state.frame_monotonic, state.info.sys_id)
@@ -1689,17 +1804,22 @@ impl Reactor {
                 let needs_layout_sync = window.is_some_and(|window| {
                     self.layout_manager.layout_engine.focused_window() != Some(window)
                 });
-                return window_workflow::handle_mouse_moved_over_window(
+                let outcome = window_workflow::handle_mouse_moved_over_window(
                     &self.app_manager,
                     window_workflow::MouseMovedPayload {
                         window,
-                        should_sync: window
-                            .is_some_and(|window| self.should_raise_on_mouse_over(window)),
+                        should_sync: window.is_some_and(|window| {
+                            self.should_raise_on_mouse_over(window, active_space)
+                        }),
                         is_main: window.is_some_and(|window| self.main_window() == Some(window)),
                         needs_layout_sync,
                         active_space,
                     },
-                );
+                )?;
+                if !outcome.raise_requests.is_empty() {
+                    self.pending_mouse_focus = window.map(|window| (window, Instant::now()));
+                }
+                return Ok(outcome);
             }
             Event::MissionControlNativeEntered => {
                 return topology_workflow::handle_mission_control_native_entered(
@@ -1713,6 +1833,9 @@ impl Reactor {
                 );
             }
             Event::RaiseCompleted { window_id, sequence_id } => {
+                if self.pending_mouse_focus.is_some_and(|(window, _)| window == window_id) {
+                    self.pending_mouse_focus = None;
+                }
                 return Ok(system_workflow::handle_raise_completed(
                     system_workflow::RaiseCompletedPayload {
                         window: window_id,
@@ -1927,10 +2050,8 @@ impl Reactor {
                         }
                     }
                 }
-                if let layout::LayoutCommand::SetWorkspaceLayout {
-                    workspace: Some(index),
-                    mode,
-                } = &command
+                if let layout::LayoutCommand::SetWorkspaceLayout { workspace: Some(index), mode } =
+                    &command
                     && self.config.virtual_workspaces.shared_across_displays
                 {
                     // Same rewrite as a window move, and for the same reason: the engine
@@ -1992,8 +2113,9 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::MoveWorkspaceToDisplay {
                 selector,
                 workspace,
+                wrap_around,
             })) => {
-                return self.move_workspace_to_display(&selector, workspace);
+                return self.move_workspace_to_display(&selector, workspace, wrap_around);
             }
             Event::Command(Command::Reactor(ReactorCommand::MoveWindowToDisplay {
                 selector,
@@ -2073,7 +2195,7 @@ impl Reactor {
                 if source_space == target_space {
                     return Ok(EventOutcome::no_change());
                 }
-                let target_frame = Self::centered_frame_on_screen(window_frame, target_screen.frame);
+                let target_frame = Self::center_frame_on_screen(window_frame, target_screen.frame);
                 return command_workflow::handle_command_reactor_move_window_to_display(
                     &mut self.state,
                     &mut self.layout_manager,
@@ -2114,7 +2236,8 @@ impl Reactor {
             self.recompute_and_set_active_spaces_from_current_screens();
         }
         if outcome.recover_after_mission_control {
-            self.repair_spaces_after_mission_control();
+            // Apply any SpaceChanged that arrived while Mission Control was active.
+            self.try_apply_pending_space_change();
             self.refresh_windows_after_mission_control();
         }
         if outcome.refresh_window_inventories {
@@ -2375,13 +2498,15 @@ impl Reactor {
         #[cfg(test)]
         self.event_outcome_phase_trace.push("broadcasts");
         if outcome.arrange.passes > 0 && layout_changed {
-            self.broadcast_layout_changed(
+            self.broadcast_layout_state_changed(
                 outcome.arrange.space_scope.or_else(|| self.workspace_command_space()),
+                rift_protocol::EventKind::LayoutChanged,
             );
         }
         if outcome.broadcast_selection_changed {
-            self.broadcast_selection_changed(
+            self.broadcast_layout_state_changed(
                 outcome.arrange.space_scope.or_else(|| self.workspace_command_space()),
+                rift_protocol::EventKind::SelectionChanged,
             );
         }
         for broadcast in outcome.window_title_broadcasts {
@@ -2664,14 +2789,6 @@ impl Reactor {
         }
     }
 
-    fn broadcast_layout_changed(&self, space: Option<SpaceId>) {
-        self.broadcast_layout_state_changed(space, rift_protocol::EventKind::LayoutChanged);
-    }
-
-    fn broadcast_selection_changed(&self, space: Option<SpaceId>) {
-        self.broadcast_layout_state_changed(space, rift_protocol::EventKind::SelectionChanged);
-    }
-
     fn broadcast_layout_state_changed(
         &self,
         space: Option<SpaceId>,
@@ -2849,7 +2966,7 @@ impl Reactor {
                 .update_space_display(space, Some(display_uuid.to_string()));
         }
         self.apply_shared_workspace_topology();
-        let current_screens = self.screens_for_current_spaces();
+        let current_screens = self.space_state.screens.clone();
         self.space_activation_policy
             .on_spaces_updated(activation_config, &current_screens);
         self.recompute_and_set_active_spaces(&authoritative_spaces);
@@ -2893,11 +3010,6 @@ impl Reactor {
         }
     }
 
-    fn repair_spaces_after_mission_control(&mut self) {
-        // First, apply any SpaceChanged that arrived while MC was active.
-        self.try_apply_pending_space_change();
-    }
-
     fn on_windows_discovered_with_app_info(
         &mut self,
         pid: pid_t,
@@ -2915,25 +3027,7 @@ impl Reactor {
                 (wid.pid == pid && self.is_window_on_known_inactive_space(wid)).then_some(wid)
             })
             .collect();
-        let server_observations = self
-            .state
-            .windows
-            .iter_windows()
-            .filter_map(|(wid, window)| (wid.pid == pid).then_some(window.info.sys_id).flatten())
-            .map(|wsid| {
-                let info = self
-                    .state
-                    .windows
-                    .get_window_server_info(wsid)
-                    .or_else(|| window_server::get_window(wsid));
-                (wsid, window_discovery::StaleWindowObservation {
-                    info,
-                    suitable: window_server::app_window_suitability(wsid),
-                    ordered_in: window_server::window_ordered_in(wsid),
-                })
-            })
-            .collect();
-        let stale_snapshot = window_discovery::StaleCleanupSnapshot {
+        let mut stale_snapshot = window_discovery::StaleCleanupSnapshot {
             suppressed: matches!(
                 self.refocus_manager.stale_cleanup_state,
                 StaleCleanupState::Suppressed
@@ -2941,7 +3035,7 @@ impl Reactor {
             mission_control_active: self.is_mission_control_active(),
             drag_active: self.is_in_drag(),
             inactive_windows,
-            server_observations,
+            server_observations: Default::default(),
         };
         // AX can replace a window's process-local identity while preserving its
         // WindowServer id. Treat the currently tracked identity as visible for
@@ -2950,6 +3044,21 @@ impl Reactor {
         cleanup_visible.extend(new.iter().filter_map(|(_, info)| {
             info.sys_id.and_then(|wsid| self.state.windows.tracked_window_id(wsid))
         }));
+        window_discovery::observe_stale_windows(
+            &self.state,
+            pid,
+            &cleanup_visible,
+            &mut stale_snapshot,
+            |wsid| window_discovery::StaleWindowObservation {
+                info: self
+                    .state
+                    .windows
+                    .get_window_server_info(wsid)
+                    .or_else(|| window_server::get_window(wsid)),
+                suitable: window_server::app_window_suitability(wsid),
+                ordered_in: window_server::window_ordered_in(wsid),
+            },
+        );
         let stale_windows = window_discovery::identify_stale_windows(
             &self.state,
             pid,
@@ -3454,20 +3563,45 @@ impl Reactor {
         observation: Option<SpaceId>,
     ) -> Option<SpaceId> {
         let pending = self.pending_target_space_for_window_server_id(wsid);
-        let live = window_server::window_space(wsid);
         let prior = self.state.windows.window_server_space(wsid);
 
-        match (observation, pending) {
+        let (resolved, live) = match (observation, pending) {
             (Some(observed), Some(target)) if observed != target => {
-                if live == Some(observed) {
+                let live = window_server::window_space(wsid);
+                let resolved = if live == Some(observed) {
                     Some(observed)
                 } else {
                     Some(target)
-                }
+                };
+                (resolved, Some(live))
             }
-            (Some(observed), _) => Some(observed),
-            (None, _) => live.or(pending).or(prior),
+            (Some(observed), _) => (Some(observed), None),
+            (None, _) => {
+                let live = window_server::window_space(wsid);
+                (live.or(pending).or(prior), Some(live))
+            }
+        };
+        match live {
+            Some(live) => trace!(
+                ?wsid,
+                ?observation,
+                ?pending,
+                ?prior,
+                ?live,
+                ?resolved,
+                "Resolved native space"
+            ),
+            None => trace!(
+                ?wsid,
+                ?observation,
+                ?pending,
+                ?prior,
+                live = "not queried",
+                ?resolved,
+                "Resolved native space"
+            ),
         }
+        resolved
     }
 
     fn best_space_for_window_id(&self, wid: WindowId) -> Option<SpaceId> {
@@ -3528,10 +3662,10 @@ impl Reactor {
     }
 
     pub fn warp_mouse(&mut self, point: CGPoint) {
-        let Some(event_tap_tx) = self.communication_manager.event_tap_tx.clone() else {
+        let Some(input_tx) = self.communication_manager.input_tx.clone() else {
             return;
         };
-        _ = event_tap_tx.send(crate::actor::event_tap::Request::Warp(point));
+        _ = input_tx.send(crate::actor::input::Request::Warp(point));
     }
 
     fn warp_mouse_to_space_center(&mut self, space: SpaceId) -> bool {
@@ -3646,8 +3780,8 @@ impl Reactor {
                 request.window,
             );
         }
-        if focus_changed && let Some(event_tap_tx) = &self.communication_manager.event_tap_tx {
-            _ = event_tap_tx.send(crate::actor::event_tap::Request::HideOnFocus);
+        if focus_changed && let Some(input_tx) = &self.communication_manager.input_tx {
+            _ = input_tx.send(crate::actor::input::Request::HideOnFocus);
         }
         let geometry_changed = response.changed;
         self.prepare_refocus_after_layout_event(&event_clone);
@@ -3690,6 +3824,23 @@ impl Reactor {
             };
 
             let window_server_id = window.info.sys_id;
+            if let Some(workspace) = self
+                .layout_manager
+                .layout_engine
+                .virtual_workspace_manager()
+                .workspace_for_window(&self.state.windows, placement.space, placement.window)
+                && self.layout_manager.layout_engine.virtual_workspace_manager().workspaces
+                    [workspace]
+                    .layout_mode()
+                    == crate::common::config::LayoutMode::Floating
+            {
+                self.layout_manager.layout_engine.store_floating_position(
+                    placement.space,
+                    workspace,
+                    placement.window,
+                    frame,
+                );
+            }
             let transaction = if let Some(window_server_id) = window_server_id {
                 let transaction = self.transaction_manager.generate_next_txid(window_server_id);
                 self.transaction_manager.store_txid(window_server_id, transaction, frame);
@@ -3743,12 +3894,16 @@ impl Reactor {
 
     // Returns true if the window should be raised on mouse over considering
     // active workspace membership and potential occlusion of floating windows above it.
-    pub(crate) fn should_raise_on_mouse_over(&self, wid: WindowId) -> bool {
+    pub(crate) fn should_raise_on_mouse_over(&self, wid: WindowId, space: Option<SpaceId>) -> bool {
         let Some(window) = self.state.windows.window(wid) else {
             return false;
         };
 
         if !window.is_admitted() && !self.layout_manager.layout_engine.is_window_floating(wid) {
+            trace!(
+                ?wid,
+                "Skipping mouse focus for a window outside admission policy"
+            );
             return false;
         }
 
@@ -3759,10 +3914,12 @@ impl Reactor {
             return false;
         }
 
-        let Some(space) = self.best_space_for_window(&candidate_frame, window.info.sys_id) else {
+        let Some(space) = space else {
+            trace!(?wid, "Skipping mouse focus without a resolved space");
             return false;
         };
         if !self.is_space_active(space) {
+            trace!(?wid, ?space, "Skipping mouse focus on an inactive space");
             return false;
         }
 
@@ -3779,13 +3936,24 @@ impl Reactor {
             return true;
         };
 
+        // Native stacking order matters only if another tracked floating
+        // window could be completely covered by this raise.
+        let could_occlude = self.state.windows.iter_windows().any(|(other, state)| {
+            other != wid
+                && state.info.sys_id.is_some()
+                && self.layout_manager.layout_engine.is_window_floating(other)
+                && candidate_frame.contains_rect(state.frame_monotonic)
+        });
+        if !could_occlude {
+            return true;
+        }
+
         let order = {
             let space_id = space.get();
             crate::sys::window_server::space_window_list_for_connection(&[space_id], 0, false)
         };
         let candidate_u32 = candidate_wsid.as_u32();
-        let candidate_level = window_level(candidate_u32);
-        let candidate_sub_level = window_sub_level(candidate_u32);
+        let mut candidate_levels = None;
 
         for above_u32 in order {
             if above_u32 == candidate_u32 {
@@ -3809,6 +3977,10 @@ impl Reactor {
                 continue;
             }
 
+            let (candidate_level, candidate_sub_level) =
+                *candidate_levels.get_or_insert_with(|| {
+                    (window_level(candidate_u32), window_sub_level(candidate_u32))
+                });
             let above_level = window_level(above_u32);
             let above_sub_level = window_sub_level(above_u32);
             if candidate_level
@@ -4632,8 +4804,8 @@ impl Reactor {
     }
 
     fn set_focus_follows_mouse_enabled(&self, enabled: bool) {
-        if let Some(event_tap_tx) = self.communication_manager.event_tap_tx.as_ref() {
-            event_tap_tx.send(event_tap::Request::SetFocusFollowsMouseEnabled(enabled));
+        if let Some(input_tx) = self.communication_manager.input_tx.as_ref() {
+            input_tx.send(input::Request::SetFocusFollowsMouseEnabled(enabled));
         }
     }
 
@@ -4645,7 +4817,7 @@ impl Reactor {
     }
 
     fn update_event_tap_layout_mode(&mut self) {
-        let Some(event_tap_tx) = self.communication_manager.event_tap_tx.as_ref() else {
+        let Some(input_tx) = self.communication_manager.input_tx.as_ref() else {
             return;
         };
 
@@ -4677,10 +4849,7 @@ impl Reactor {
 
         let modes_by_space = modes.iter().copied().collect();
         self.notification_manager.last_layout_modes_by_space = modes_by_space;
-        if let Some(gesture_tap_tx) = self.communication_manager.gesture_tap_tx.as_ref() {
-            gesture_tap_tx.send(gesture_tap::GestureRequest::LayoutModesChanged(modes.clone()));
-        }
-        event_tap_tx.send(crate::actor::event_tap::Request::LayoutModesChanged(modes));
+        input_tx.send(crate::actor::input::Request::LayoutModesChanged(modes));
     }
 
     fn set_mission_control_active(&mut self, active: bool) {
@@ -4895,10 +5064,8 @@ impl Reactor {
                     return None;
                 }
                 let origin = origin_override.or_else(|| self.current_screen_center())?;
-                let current = screens
-                    .iter()
-                    .position(|screen| screen.frame.contains(origin))
-                    .unwrap_or(0);
+                let current =
+                    screens.iter().position(|screen| screen.frame.contains(origin)).unwrap_or(0);
                 let offset = match cycle {
                     crate::common::config::DisplayCycle::Next => 1,
                     crate::common::config::DisplayCycle::Prev => screens.len() - 1,
@@ -4910,6 +5077,67 @@ impl Reactor {
                 self.space_state.screens.iter().find(|screen| screen.display_uuid == *uuid)
             }
         }
+    }
+
+    fn screen_for_selector_wrapping(
+        &self,
+        selector: &DisplaySelector,
+        origin_override: Option<CGPoint>,
+    ) -> Option<&ScreenInfo> {
+        if let Some(screen) = self.screen_for_selector(selector, origin_override) {
+            return Some(screen);
+        }
+        let DisplaySelector::Direction(direction) = selector else {
+            return None;
+        };
+        let origin = origin_override.or_else(|| self.current_screen_center())?;
+        let screens = &self.space_state.screens;
+        let wrapped_origin = match direction {
+            Direction::Right => CGPoint::new(
+                screens
+                    .iter()
+                    .map(|screen| screen.frame.min().x)
+                    .min_by(|a, b| a.total_cmp(b))?
+                    - 1.0,
+                origin.y,
+            ),
+            Direction::Left => CGPoint::new(
+                screens
+                    .iter()
+                    .map(|screen| screen.frame.max().x)
+                    .max_by(|a, b| a.total_cmp(b))?
+                    + 1.0,
+                origin.y,
+            ),
+            Direction::Down => CGPoint::new(
+                origin.x,
+                screens
+                    .iter()
+                    .map(|screen| screen.frame.min().y)
+                    .min_by(|a, b| a.total_cmp(b))?
+                    - 1.0,
+            ),
+            Direction::Up => CGPoint::new(
+                origin.x,
+                screens
+                    .iter()
+                    .map(|screen| screen.frame.max().y)
+                    .max_by(|a, b| a.total_cmp(b))?
+                    + 1.0,
+            ),
+        };
+        self.screen_for_direction_from_point(wrapped_origin, *direction)
+    }
+
+    fn center_frame_on_screen(frame: CGRect, screen: CGRect) -> CGRect {
+        let min = screen.min();
+        let max = screen.max();
+        let max_x = (max.x - frame.size.width).max(min.x);
+        let max_y = (max.y - frame.size.height).max(min.y);
+        let mut origin = screen.mid();
+        origin.x = (origin.x - frame.size.width / 2.0).clamp(min.x, max_x);
+        origin.y = (origin.y - frame.size.height / 2.0).clamp(min.y, max_y);
+        CGRect::new(origin, frame.size)
     }
 
     fn screens_in_physical_order(&self) -> Vec<&ScreenInfo> {
@@ -4943,26 +5171,26 @@ impl Reactor {
             layout::LayoutCommand::SwitchToWorkspace(index) => {
                 workspaces.workspace_at_global_index(*index)
             }
-            layout::LayoutCommand::NextWorkspace(skip_empty) => workspaces
-                .active_workspace(command_space)
-                .and_then(|current| {
+            layout::LayoutCommand::NextWorkspace(skip_empty) => {
+                workspaces.active_workspace(command_space).and_then(|current| {
                     workspaces.step_workspace_global(
                         &self.state.windows,
                         current,
                         *skip_empty,
                         Direction::Right,
                     )
-                }),
-            layout::LayoutCommand::PrevWorkspace(skip_empty) => workspaces
-                .active_workspace(command_space)
-                .and_then(|current| {
+                })
+            }
+            layout::LayoutCommand::PrevWorkspace(skip_empty) => {
+                workspaces.active_workspace(command_space).and_then(|current| {
                     workspaces.step_workspace_global(
                         &self.state.windows,
                         current,
                         *skip_empty,
                         Direction::Left,
                     )
-                }),
+                })
+            }
             layout::LayoutCommand::SwitchToLastWorkspace => workspaces
                 .last_active_global()
                 .and_then(|id| Some((id, workspaces.workspace_space(id)?))),
@@ -4973,7 +5201,11 @@ impl Reactor {
             return SharedRetarget::Unchanged;
         };
         if !self.is_space_active(space) {
-            warn!(?space, ?workspace, "Workspace command ignored: its display is inactive");
+            warn!(
+                ?space,
+                ?workspace,
+                "Workspace command ignored: its display is inactive"
+            );
             return SharedRetarget::Unchanged;
         }
         let crossed_displays = space != command_space;
@@ -5022,6 +5254,7 @@ impl Reactor {
         &mut self,
         selector: &crate::common::config::DisplaySelector,
         workspace: Option<usize>,
+        wrap_around: bool,
     ) -> anyhow::Result<EventOutcome> {
         if self.is_in_drag() {
             warn!("Ignoring move-workspace-to-display while a drag is active");
@@ -5036,7 +5269,10 @@ impl Reactor {
             None => workspaces.active_workspace(command_space),
         };
         let Some(target_workspace) = target_workspace else {
-            warn!(?workspace, "Move workspace to display ignored: workspace not found");
+            warn!(
+                ?workspace,
+                "Move workspace to display ignored: workspace not found"
+            );
             return Ok(EventOutcome::no_change());
         };
         let Some(source_space) = workspaces.workspace_space(target_workspace) else {
@@ -5048,25 +5284,81 @@ impl Reactor {
             .screen_by_space(source_space)
             .map(|screen| screen.frame.mid())
             .or_else(|| self.current_screen_center());
-        let Some(target_screen) = self.screen_for_selector(selector, origin).cloned() else {
-            warn!(?selector, "Move workspace to display ignored: target display not found");
+        let target_screen = if wrap_around {
+            self.screen_for_selector_wrapping(selector, origin)
+        } else {
+            self.screen_for_selector(selector, origin)
+        };
+        let Some(target_screen) = target_screen.cloned() else {
+            warn!(
+                ?selector,
+                "Move workspace to display ignored: target display not found"
+            );
             return Ok(EventOutcome::no_change());
         };
         let Some(target_space) = target_screen.space.filter(|space| self.is_space_active(*space))
         else {
-            warn!(?selector, "Move workspace to display ignored: target space unavailable");
+            warn!(
+                ?selector,
+                "Move workspace to display ignored: target space unavailable"
+            );
             return Ok(EventOutcome::no_change());
         };
         if target_space == source_space {
             return Ok(EventOutcome::no_change());
         }
 
-        let windows = self.layout_manager.layout_engine.move_workspace_to_space(
-            &mut self.state.windows,
-            target_workspace,
-            target_space,
-            target_screen.frame.size,
-        );
+        // Shared mode hands the workspace itself to the other display. Display-local
+        // workspaces cannot migrate, so the windows land in the destination's workspace at
+        // the same ordinal and that one becomes active instead.
+        let shared = self
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .shared_across_displays();
+        let (target_workspace, windows) = if shared {
+            let windows = self.layout_manager.layout_engine.move_workspace_to_space(
+                &mut self.state.windows,
+                target_workspace,
+                target_space,
+                target_screen.frame.size,
+            );
+            (target_workspace, windows)
+        } else {
+            let manager = self.layout_manager.layout_engine.virtual_workspace_manager();
+            let Some(ordinal) = manager.local_index_of(source_space, target_workspace) else {
+                return Ok(EventOutcome::no_change());
+            };
+            let moved =
+                manager.workspace_windows(&self.state.windows, source_space, target_workspace);
+            let destination = self
+                .layout_manager
+                .layout_engine
+                .virtual_workspace_manager_mut()
+                .list_workspaces(target_space)
+                .get(ordinal)
+                .map(|(id, _)| *id);
+            let Some(destination) = destination else {
+                warn!(
+                    ordinal,
+                    "Move workspace to display ignored: destination display has no workspace at that ordinal"
+                );
+                return Ok(EventOutcome::no_change());
+            };
+            for &window in &moved {
+                // Per-window raises are discarded: the switch below decides what ends up
+                // focused on the destination display.
+                let _ = self.layout_manager.layout_engine.move_window_to_space(
+                    &mut self.state.windows,
+                    source_space,
+                    target_space,
+                    target_screen.frame.size,
+                    window,
+                    Some(destination),
+                );
+            }
+            (destination, moved)
+        };
 
         let mut outcome = EventOutcome::layout_changed(false).with_arrange_space_scope(None);
         for window in windows {
@@ -5076,7 +5368,7 @@ impl Reactor {
             let window_server_id = state.info.sys_id;
             // Writing the frame onto the target screen is what actually makes macOS
             // reparent the window; the arrange pass then lays it out properly.
-            let frame = Self::centered_frame_on_screen(state.frame_monotonic, target_screen.frame);
+            let frame = Self::center_frame_on_screen(state.frame_monotonic, target_screen.frame);
             if let Some(window_state) = self.state.windows.window_mut(window) {
                 window_state.frame_monotonic = frame;
             }
@@ -5155,15 +5447,18 @@ impl Reactor {
             crate::common::config::WorkspaceSelector::Name(name)
                 if name == "next" || name == "prev" =>
             {
-                let direction = if name == "next" { Direction::Right } else { Direction::Left };
+                let direction = if name == "next" {
+                    Direction::Right
+                } else {
+                    Direction::Left
+                };
                 workspaces.step_workspace_global(&self.state.windows, current?, None, direction)?
             }
-            crate::common::config::WorkspaceSelector::Name(name) => workspaces
-                .global_workspace_order()
-                .into_iter()
-                .find(|(id, space)| {
+            crate::common::config::WorkspaceSelector::Name(name) => {
+                workspaces.global_workspace_order().into_iter().find(|(id, space)| {
                     workspaces.workspace_info(*space, *id).is_some_and(|ws| &ws.name == name)
-                })?,
+                })?
+            }
         };
         Some((window, source_space, target_workspace, target_space))
     }
@@ -5204,7 +5499,10 @@ impl Reactor {
         }
 
         if !self.is_space_active(target_space) {
-            warn!(?target_space, "Move window to workspace ignored: its display is inactive");
+            warn!(
+                ?target_space,
+                "Move window to workspace ignored: its display is inactive"
+            );
             return SharedWindowMove::Handled(Box::new(Ok(EventOutcome::no_change())));
         }
         let Some(window_state) = self.state.windows.window(window) else {
@@ -5256,7 +5554,7 @@ impl Reactor {
                 source_space,
                 target_space,
                 target_screen,
-                target_frame: Self::centered_frame_on_screen(window_frame, target_screen),
+                target_frame: Self::center_frame_on_screen(window_frame, target_screen),
                 target_workspace: Some(target_workspace),
             },
         );
@@ -5274,18 +5572,6 @@ impl Reactor {
             }
         }
         SharedWindowMove::Handled(Box::new(Ok(outcome)))
-    }
-
-    /// Centers `frame` on `screen`, clamped so the window stays fully on it.
-    fn centered_frame_on_screen(frame: CGRect, screen: CGRect) -> CGRect {
-        let mut origin = screen.mid();
-        origin.x -= frame.size.width / 2.0;
-        origin.y -= frame.size.height / 2.0;
-        let min = screen.min();
-        let max = screen.max();
-        origin.x = origin.x.max(min.x).min(max.x - frame.size.width);
-        origin.y = origin.y.max(min.y).min(max.y - frame.size.height);
-        CGRect::new(origin, frame.size)
     }
 
     /// Reconciles the shared workspace pool with the attached displays. No-op unless

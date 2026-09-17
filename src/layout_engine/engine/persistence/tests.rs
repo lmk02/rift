@@ -1905,10 +1905,9 @@ fn space_restore_rejects_workspace_count_mismatch_before_mutating_layouts() {
         .add_window_after_selection(target_layout, sentinel);
 
     let error = engine
-        .restore_saved_layout(
+        .restore_layout(
             path.clone(),
-            RestoreScope::Space,
-            space,
+            RestoreRequest::new(RestoreScope::Space, space),
             &mut window_store,
             &VirtualWorkspaceSettings::default(),
             &LayoutSettings::default(),
@@ -1994,6 +1993,7 @@ fn every_layout_system_round_trips_through_ron() {
         LayoutMode::Stack,
         LayoutMode::MasterStack,
         LayoutMode::Scrolling,
+        LayoutMode::Floating,
     ] {
         let system = VirtualWorkspace::create_layout_system(mode, &settings);
         let serialized = ron::ser::to_string(&system).unwrap();
@@ -2346,6 +2346,12 @@ fn toggling_shared_across_displays_discards_the_incompatible_restored_topology()
 
     // Round-tripping within the same mode keeps the topology.
     let mut same_mode = LayoutEngine::deserialize_from_str(&serialized).unwrap();
-    same_mode.finish_loading(&VirtualWorkspaceSettings::default(), &LayoutSettings::default(), None);
-    assert_eq!(same_mode.virtual_workspace_manager().initialized_spaces(), vec![space]);
+    same_mode.finish_loading(
+        &VirtualWorkspaceSettings::default(),
+        &LayoutSettings::default(),
+        None,
+    );
+    assert_eq!(same_mode.virtual_workspace_manager().initialized_spaces(), vec![
+        space
+    ]);
 }

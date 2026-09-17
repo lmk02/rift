@@ -13,20 +13,21 @@ use std::time::{Duration, Instant};
 use objc2::rc::Retained;
 use objc2_app_kit::NSRunningApplication;
 use objc2_application_services::AXError;
-use objc2_core_foundation::{CFRunLoop, CGPoint, CGRect};
+use objc2_core_foundation::{CGPoint, CGRect};
 use serde::{Deserialize, Serialize};
+use tokio::select;
 use tokio::sync::oneshot;
-use tokio::{join, select};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, info, instrument, trace, warn};
 
 use crate::actor;
 use crate::actor::reactor::transaction_manager::TransactionId;
 use crate::actor::reactor::{self, Event, Requested};
+use crate::actor::wm_controller::{self, WmEvent};
 use crate::common::collections::{HashMap, HashSet};
 use crate::model::tx_store::WindowTxStore;
-use crate::sys::app::NSRunningApplicationExt;
 pub use crate::sys::app::{AppInfo, WindowInfo, pid_t};
+use crate::sys::app::{NSRunningApplicationExt, NativeWindowIdentity};
 use crate::sys::axuielement::{AX_STANDARD_WINDOW_SUBROLE, AXUIElement, Error as AxError};
 use crate::sys::enhanced_ui::EnhancedUi;
 use crate::sys::event;
@@ -316,6 +317,15 @@ impl AppThreadHandle {
         this
     }
 
+    pub fn channel() -> (Self, actor::Receiver<Request>) {
+        let (requests_tx, rx) = actor::channel();
+        (Self { requests_tx }, rx)
+    }
+
+    pub(crate) fn same_actor(&self, other: &Self) -> bool {
+        self.requests_tx.same_channel(&other.requests_tx)
+    }
+
     pub fn send(&self, req: Request) -> anyhow::Result<()> { Ok(self.requests_tx.send(req)) }
 }
 
@@ -383,16 +393,30 @@ pub enum Quiet {
     No,
 }
 
+struct ExitGuard(wm_controller::Sender, pid_t, AppThreadHandle);
+impl Drop for ExitGuard {
+    fn drop(&mut self) { self.0.send(WmEvent::AppExited(self.1, self.2.clone())); }
+}
+
 pub fn spawn_app_thread(
     pid: pid_t,
     info: AppInfo,
     events_tx: reactor::Sender,
     tx_store: Option<WindowTxStore>,
+    wm_tx: wm_controller::Sender,
+    handle: AppThreadHandle,
+    requests_rx: actor::Receiver<Request>,
 ) {
-    thread::Builder::new()
+    let guard = ExitGuard(wm_tx.clone(), pid, handle.clone());
+    if let Err(err) = thread::Builder::new()
         .name(format!("{}({pid})", info.bundle_id.as_deref().unwrap_or("")))
-        .spawn(move || app_thread_main(pid, info, events_tx, tx_store))
-        .unwrap();
+        .spawn(move || {
+            let _guard = guard; // Also reports early initialization failures and panics.
+            app_thread_main(pid, info, events_tx, tx_store, handle.requests_tx, requests_rx);
+        })
+    {
+        warn!(pid, ?err, "Failed to spawn app thread");
+    }
 }
 
 struct State {
@@ -449,18 +473,22 @@ impl State {
                 return Err(e);
             }
         };
-        let server_info_by_id = self.visible_window_server_info_map(&window_elems);
+        let mut window_elems: Vec<_> = window_elems
+            .into_iter()
+            .map(|elem| (elem, NativeWindowIdentity::default()))
+            .collect();
+        let server_info_by_id = self.visible_window_server_info_map(&mut window_elems);
         let mut new = Vec::with_capacity(window_elems.len());
         let mut known_visible = Vec::with_capacity(window_elems.len());
         let mut seen_wids = HashSet::default();
 
-        for elem in window_elems {
-            let wsid = WindowServerId::try_from(&elem).ok();
+        for (elem, mut identity) in window_elems {
+            let wsid = identity.resolve(|| WindowServerId::try_from(&elem).ok());
             let hint = wsid.and_then(|id| server_info_by_id.get(&id).copied());
-            let info = match WindowInfo::from_ax_element(&elem, hint) {
+            let info = match WindowInfo::from_ax_element_with_identity(&elem, hint, &mut identity) {
                 Ok((info, _)) => info,
                 Err(err) => {
-                    let id = self.id(&elem).ok();
+                    let id = self.id_with_identity(&elem, &mut identity).ok();
                     trace!(?id, ?err, "Failed to refresh window info; will retry later");
                     continue;
                 }
@@ -470,10 +498,14 @@ impl State {
                 continue;
             }
 
-            let Some((wid, info)) = self.id(&elem).ok().map(|wid| (wid, info)).or_else(|| {
-                self.register_window(elem.clone(), hint)
-                    .map(|(registered_info, wid, _)| (wid, registered_info))
-            }) else {
+            let Some((wid, info)) =
+                self.id_with_identity(&elem, &mut identity).ok().map(|wid| (wid, info)).or_else(
+                    || {
+                        self.register_window_with_identity(elem.clone(), hint, &mut identity)
+                            .map(|(registered_info, wid, _)| (wid, registered_info))
+                    },
+                )
+            else {
                 continue;
             };
 
@@ -541,10 +573,12 @@ impl State {
         }
 
         let this = RefCell::new(self);
-        join!(
-            Self::handle_incoming(&this, requests_rx, notifications_rx),
-            Self::handle_raises(&this, raises_rx),
-        );
+        // The raises channel is owned by State, so joining both tasks would keep
+        // the actor (and its observer) alive after the incoming task terminates.
+        select! {
+            _ = Self::handle_incoming(&this, requests_rx, notifications_rx) => {},
+            _ = Self::handle_raises(&this, raises_rx) => {},
+        }
     }
 
     async fn handle_incoming(
@@ -602,7 +636,6 @@ impl State {
                 #[allow(non_upper_case_globals)]
                 Err(AxError::Ax(AXError::CannotComplete)) if state.running_app.isTerminated() => {
                     warn!(?state.bundle_id, ?state.pid, "Application terminated without notification");
-                    state.send_event(Event::ApplicationThreadTerminated(state.pid));
                     should_terminate = true;
                     break;
                 }
@@ -726,8 +759,14 @@ impl State {
             }
         }
 
-        let initial_window_elements = self.app.windows().unwrap_or_default();
-        let server_info_by_id = self.visible_window_server_info_map(&initial_window_elements);
+        let mut initial_window_elements: Vec<_> = self
+            .app
+            .windows()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|elem| (elem, NativeWindowIdentity::default()))
+            .collect();
+        let server_info_by_id = self.visible_window_server_info_map(&mut initial_window_elements);
 
         let window_count = initial_window_elements.len();
         self.windows.reserve(window_count);
@@ -735,8 +774,8 @@ impl State {
         let mut windows = Vec::with_capacity(window_count);
         let mut window_server_info = Vec::with_capacity(window_count);
 
-        for elem in initial_window_elements {
-            let wsid = WindowServerId::try_from(&elem).ok();
+        for (elem, mut identity) in initial_window_elements {
+            let wsid = identity.resolve(|| WindowServerId::try_from(&elem).ok());
             let hint = wsid.and_then(|id| server_info_by_id.get(&id).copied());
             if let Some(info) = hint {
                 window_server_info.push(info);
@@ -745,7 +784,9 @@ impl State {
                 trace!(pid = ?self.pid, ?wsid, "Ignoring AX window without a visible CG window");
                 continue;
             }
-            let Some((info, wid, _)) = self.register_window(elem, hint) else {
+            let Some((info, wid, _)) =
+                self.register_window_with_identity(elem, hint, &mut identity)
+            else {
                 continue;
             };
             windows.push((wid, info));
@@ -771,8 +812,6 @@ impl State {
     fn handle_request(&mut self, request: Request) -> Result<bool, AxError> {
         match request {
             Request::Terminate => {
-                CFRunLoop::current().unwrap().stop();
-                self.send_event(Event::ApplicationThreadTerminated(self.pid));
                 return Ok(true);
             }
             Request::WindowMaybeDestroyed(wid) => {
@@ -1585,7 +1624,21 @@ impl State {
         elem: AXUIElement,
         server_info_hint: Option<WindowServerInfo>,
     ) -> Option<(WindowInfo, WindowId, Option<WindowServerInfo>)> {
-        let Ok((mut info, server_info)) = WindowInfo::from_ax_element(&elem, server_info_hint)
+        self.register_window_with_identity(
+            elem,
+            server_info_hint,
+            &mut NativeWindowIdentity::default(),
+        )
+    }
+
+    fn register_window_with_identity(
+        &mut self,
+        elem: AXUIElement,
+        server_info_hint: Option<WindowServerInfo>,
+        identity: &mut NativeWindowIdentity,
+    ) -> Option<(WindowInfo, WindowId, Option<WindowServerInfo>)> {
+        let Ok((mut info, server_info)) =
+            WindowInfo::from_ax_element_with_identity(&elem, server_info_hint, identity)
         else {
             return None;
         };
@@ -1635,12 +1688,11 @@ impl State {
         }
 
         let window_server_id = info.sys_id.filter(|sid| sid.as_nonzero().is_some()).or_else(|| {
-            WindowServerId::try_from(&elem)
-                .or_else(|e| {
-                    info!("Could not get window server id for {elem:?}: {e}");
-                    Err(e)
-                })
-                .ok()
+            identity.resolve(|| {
+                WindowServerId::try_from(&elem)
+                    .map_err(|e| info!("Could not get window server id for {elem:?}: {e}"))
+                    .ok()
+            })
         });
 
         let idx = window_server_id.and_then(WindowServerId::as_nonzero).unwrap_or_else(|| {
@@ -1760,11 +1812,13 @@ impl State {
 
     fn visible_window_server_info_map(
         &self,
-        window_elements: &[AXUIElement],
+        window_elements: &mut [(AXUIElement, NativeWindowIdentity)],
     ) -> HashMap<WindowServerId, WindowServerInfo> {
         let wsids: Vec<WindowServerId> = window_elements
-            .iter()
-            .filter_map(|elem| WindowServerId::try_from(elem).ok())
+            .iter_mut()
+            .filter_map(|(elem, identity)| {
+                identity.resolve(|| WindowServerId::try_from(&*elem).ok())
+            })
             .collect();
         collect_visible_window_server_info(
             window_server::get_windows(&wsids),
@@ -1863,7 +1917,15 @@ impl State {
     }
 
     fn id(&self, elem: &AXUIElement) -> Result<WindowId, AxError> {
-        if let Ok(id) = WindowServerId::try_from(elem) {
+        self.id_with_identity(elem, &mut NativeWindowIdentity::default())
+    }
+
+    fn id_with_identity(
+        &self,
+        elem: &AXUIElement,
+        identity: &mut NativeWindowIdentity,
+    ) -> Result<WindowId, AxError> {
+        if let Some(id) = identity.resolve(|| WindowServerId::try_from(elem).ok()) {
             if let Some(idx) = id.as_nonzero() {
                 let wid = WindowId { pid: self.pid, idx };
                 if self.windows.contains_key(&wid) {
@@ -1978,6 +2040,8 @@ fn app_thread_main(
     info: AppInfo,
     events_tx: reactor::Sender,
     tx_store: Option<WindowTxStore>,
+    requests_tx: actor::Sender<Request>,
+    requests_rx: actor::Receiver<Request>,
 ) {
     let app = AXUIElement::application(pid);
     let Some(running_app) = NSRunningApplication::with_process_id(pid) else {
@@ -2041,7 +2105,6 @@ fn app_thread_main(
         pending_frames: HashMap::default(),
     };
 
-    let (requests_tx, requests_rx) = actor::channel();
     Executor::run(state.run(info, requests_tx, requests_rx, notifications_rx, raises_rx));
 }
 

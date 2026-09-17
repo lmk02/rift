@@ -92,6 +92,11 @@ impl VirtualWorkspace {
                     settings.traditional.equalize_nodes,
                 ),
             ),
+            LayoutMode::Floating => LayoutSystemKind::Floating(
+                crate::layout_engine::systems::FloatingLayoutSystem::new(
+                    settings.window_insertion_point_for(mode),
+                ),
+            ),
             LayoutMode::Bsp => {
                 LayoutSystemKind::Bsp(crate::layout_engine::systems::BspLayoutSystem::new(
                     settings.window_insertion_point_for(mode),
@@ -362,10 +367,7 @@ impl WorkspaceStore {
             .collect()
     }
 
-    pub fn workspace_at_global_index(
-        &self,
-        index: usize,
-    ) -> Option<(VirtualWorkspaceId, SpaceId)> {
+    pub fn workspace_at_global_index(&self, index: usize) -> Option<(VirtualWorkspaceId, SpaceId)> {
         let id = *self.ordered_workspace_ids_global().get(index)?;
         self.workspaces.get(id).map(|ws| (id, ws.space))
     }
@@ -467,8 +469,10 @@ impl WorkspaceStore {
         // workspaces can become the first one in physical order while the pool is already
         // full. `ensure_every_display_owns_a_workspace` below settles that case.
         let owned_by_home = self.ordered_workspace_ids(home);
-        if let Some(default) =
-            owned_by_home.get(self.default_workspace).or_else(|| owned_by_home.first()).copied()
+        if let Some(default) = owned_by_home
+            .get(self.default_workspace)
+            .or_else(|| owned_by_home.first())
+            .copied()
         {
             self.active_workspace_per_space.entry(home).or_insert((None, default));
         }
@@ -876,9 +880,7 @@ impl WorkspaceStore {
             };
 
             let (id, space) = order[index];
-            if !require_non_empty
-                || !self.workspace_windows(window_store, space, id).is_empty()
-            {
+            if !require_non_empty || !self.workspace_windows(window_store, space, id).is_empty() {
                 return Some((id, space));
             }
         }
@@ -1644,7 +1646,11 @@ mod tests {
         let newcomer = SpaceId::new(2);
         store.apply_display_topology(&mut windows, &[(newcomer, None)], &[]);
 
-        assert_eq!(store.ordered_workspace_ids_global().len(), 4, "the pool is unchanged");
+        assert_eq!(
+            store.ordered_workspace_ids_global().len(),
+            4,
+            "the pool is unchanged"
+        );
         assert!(
             store.active_workspace(newcomer).is_some(),
             "the visible display still has to be showing something"
@@ -1677,7 +1683,10 @@ mod tests {
             5,
             "a display that is merely in fullscreen must keep its workspaces"
         );
-        assert_eq!(store.workspace_at_global_index(0).map(|(_, space)| space), Some(left));
+        assert_eq!(
+            store.workspace_at_global_index(0).map(|(_, space)| space),
+            Some(left)
+        );
     }
 
     #[test]
@@ -1822,15 +1831,17 @@ mod tests {
         let mut store = WorkspaceStore::new();
         let windows = WindowStore::default();
         let space = SpaceId::new(1);
-        let ids: Vec<_> =
-            store.list_workspaces(space).into_iter().map(|(id, _)| id).collect();
+        let ids: Vec<_> = store.list_workspaces(space).into_iter().map(|(id, _)| id).collect();
 
         assert_eq!(store.next_workspace(&windows, space, ids[0], None), Some(ids[1]));
         assert_eq!(
             store.next_workspace(&windows, space, *ids.last().unwrap(), None),
             Some(ids[0])
         );
-        assert_eq!(store.prev_workspace(&windows, space, ids[0], None), ids.last().copied());
+        assert_eq!(
+            store.prev_workspace(&windows, space, ids[0], None),
+            ids.last().copied()
+        );
     }
 
     #[test]

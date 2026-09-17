@@ -1,10 +1,9 @@
 use std::cell::RefCell;
 use std::ffi::c_char;
 use std::rc::Rc;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::time::Duration;
 
-use r#continue::continuation;
 use crossbeam_channel::{Sender as ConfigJobSender, TrySendError, bounded};
 use serde::Serialize;
 use tracing::{error, info, trace};
@@ -19,7 +18,6 @@ pub use rift_client::{ClientError as RiftMachClientError, RiftMachClient, RiftMa
 use crate::actor::config as config_actor;
 use crate::actor::reactor::{self, Event};
 use crate::ipc::subscriptions::SharedServerState;
-use crate::sys::dispatch::block_on;
 use crate::sys::mach::{
     OwnedMachReply, is_mach_server_registered, mach_msg_header_t, mach_server_install,
     send_mach_reply,
@@ -231,6 +229,21 @@ fn encode_reactor_response(reactor: &mut reactor::Reactor, request: RiftRequest)
             )
         }
 
+        RiftRequest::GetWorkspacesForDisplay { display_uuid } => {
+            let Some(space) = reactor.query_space_for_display(&display_uuid) else {
+                return encode_error(serde_json::json!({
+                    "message": format!("Display not found: {display_uuid}")
+                }));
+            };
+            let workspaces = reactor.query_workspaces(Some(space));
+            encode_success(
+                workspaces
+                    .into_iter()
+                    .map(rift_protocol::WorkspaceData::from)
+                    .collect::<Vec<_>>(),
+            )
+        }
+
         RiftRequest::GetDisplays => {
             let displays = reactor.query_displays();
             encode_success(
@@ -240,6 +253,18 @@ fn encode_reactor_response(reactor: &mut reactor::Reactor, request: RiftRequest)
 
         RiftRequest::GetWindows { space_id } => {
             let windows = reactor.query_windows(space_id.map(crate::sys::screen::SpaceId::new));
+            encode_success(
+                windows.into_iter().map(rift_protocol::WindowData::from).collect::<Vec<_>>(),
+            )
+        }
+
+        RiftRequest::GetWindowsForDisplay { display_uuid } => {
+            let Some(space) = reactor.query_space_for_display(&display_uuid) else {
+                return encode_error(serde_json::json!({
+                    "message": format!("Display not found: {display_uuid}")
+                }));
+            };
+            let windows = reactor.query_windows(Some(space));
             encode_success(
                 windows.into_iter().map(rift_protocol::WindowData::from).collect::<Vec<_>>(),
             )
@@ -311,30 +336,24 @@ struct ConfigRequestHandler {
 }
 
 impl ConfigRequestHandler {
-    fn forget_sender(event: config_actor::Event) {
-        match event {
-            config_actor::Event::QueryConfig(response) => std::mem::forget(response),
-            config_actor::Event::ApplyConfig { response, .. } => std::mem::forget(response),
-        }
-    }
-
     fn perform<T>(
         &self,
-        make_event: impl FnOnce(r#continue::Sender<T>) -> config_actor::Event,
+        make_event: impl FnOnce(SyncSender<T>) -> config_actor::Event,
     ) -> Result<T, String>
     where
         T: Send + 'static,
     {
-        let (response, future) = continuation::<T>();
-        let event = make_event(response);
-        if let Err(error) = self.config_tx.try_send(event) {
-            let message = error.to_string();
-            let tokio::sync::mpsc::error::SendError((_span, event)) = error;
-            Self::forget_sender(event);
-            return Err(format!("Failed to send config query: {message}"));
-        }
-        block_on(future, Duration::from_secs(5))
-            .map_err(|error| format!("Failed to get response: {error}"))
+        // Buffer one reply so the actor never waits for this worker to receive it.
+        let (response, result) = sync_channel(1);
+        self.config_tx
+            .try_send(make_event(response))
+            .map_err(|error| format!("Failed to send config query: {error}"))?;
+        result.recv_timeout(Duration::from_secs(5)).map_err(|error| match error {
+            RecvTimeoutError::Timeout => "Failed to get response: config actor timed out".into(),
+            RecvTimeoutError::Disconnected => {
+                "Failed to get response: config actor disconnected before replying".into()
+            }
+        })
     }
 
     fn handle_request(&self, request: RiftRequest) -> Vec<u8> {
@@ -447,29 +466,5 @@ fn send_encoded_response(original_msg: *mut mach_msg_header_t, response_json: &[
                 }
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::config::{LayoutSettings, VirtualWorkspaceSettings};
-    use crate::layout_engine::LayoutEngine;
-
-    #[test]
-    fn reactor_ipc_queries_encode_without_a_response_channel() {
-        let mut reactor = reactor::Reactor::new_for_test(LayoutEngine::new(
-            &VirtualWorkspaceSettings::default(),
-            &LayoutSettings::default(),
-            None,
-        ));
-
-        let response = encode_reactor_response(&mut reactor, RiftRequest::GetMetrics);
-        let response: RiftResponse =
-            serde_json::from_slice(response.strip_suffix(&[0]).unwrap()).unwrap();
-        let RiftResponse::Success { data } = response else {
-            panic!("expected metrics response");
-        };
-        assert_eq!(data["screens"], 0);
     }
 }

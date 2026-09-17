@@ -4,8 +4,7 @@ use std::str::FromStr;
 use anyhow::bail;
 use regex::RegexBuilder;
 pub use rift_protocol::{
-    AnimationEasing, ConfigCommand, DisplayCycle, DisplaySelector, LayoutMode,
-    WorkspaceSelector,
+    AnimationEasing, ConfigCommand, DisplayCycle, DisplaySelector, LayoutMode, WorkspaceSelector,
 };
 use serde::{Deserialize, Serialize};
 
@@ -758,7 +757,7 @@ pub struct LayoutSettings {
     /// Settings inherited by every layout type unless overridden by its table.
     #[serde(flatten)]
     pub base: BaseLayoutSettings,
-    /// Layout mode: "traditional", "bsp", "stack", "master_stack", or "scrolling"
+    /// Layout mode: "traditional", "bsp", "stack", "master_stack", "scrolling", or "floating"
     #[serde(default)]
     pub mode: LayoutMode,
     /// Traditional layout configuration
@@ -1076,6 +1075,7 @@ impl LayoutSettings {
             LayoutMode::Stack => &self.stack.base,
             LayoutMode::MasterStack => &self.master_stack.base,
             LayoutMode::Scrolling => &self.scrolling.base,
+            LayoutMode::Floating => &self.base,
         }
     }
 
@@ -1566,7 +1566,7 @@ impl Config {
             }
         } else {
             // Use dynamically generated builtin candidates.
-            let builtin_candidates = crate::actor::wm_controller::WmCommand::builtin_candidates();
+            let builtin_candidates = crate::actor::wm_controller::WmCmd::snake_case_variants();
             for cand in builtin_candidates.iter() {
                 let dist = Self::levenshtein(&unknown_token, &cand.to_lowercase());
                 if best.is_none() || dist < best.as_ref().unwrap().1 {
@@ -1728,6 +1728,7 @@ mod tests {
                 reactor::ReactorCommand::MoveWorkspaceToDisplay {
                     selector: DisplaySelector::Direction(crate::layout_engine::Direction::Right),
                     workspace: None,
+                    wrap_around: false,
                 }
             ))
         );
@@ -1737,6 +1738,7 @@ mod tests {
                 reactor::ReactorCommand::MoveWorkspaceToDisplay {
                     selector: DisplaySelector::Index(1),
                     workspace: Some(7),
+                    wrap_around: false,
                 }
             ))
         );
@@ -1772,9 +1774,7 @@ mod tests {
             settings.workspace_display_assignment[1],
             WorkspaceDisplayAssignment {
                 workspace: WorkspaceSelector::Name("sixth".to_string()),
-                display: DisplaySelector::Uuid(
-                    "37D8832A-2D66-02CA-B9F7-8F30A301B230".to_string()
-                ),
+                display: DisplaySelector::Uuid("37D8832A-2D66-02CA-B9F7-8F30A301B230".to_string()),
             }
         );
         assert!(settings.validate().is_empty());

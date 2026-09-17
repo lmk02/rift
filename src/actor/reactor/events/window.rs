@@ -55,14 +55,7 @@ pub fn handle_window_created(
     let outcome = EventOutcome::window_membership_changed(false, true);
     Ok(
         if state.windows.window(wid).is_some_and(WindowState::can_reconcile_admission) {
-            // Finalization emits WindowAdded, and send_layout_event immediately
-            // arranges the affected space when that changes the layout. Keeping
-            // the generic membership arrange here as well starts a second layout
-            // application while the first one is still being written, which is
-            // especially visible in scrolling layouts as a brief resize/shift.
-            let mut outcome = outcome.with_arrange_passes(0);
-            outcome.finalize_created_windows.push(wid);
-            outcome
+            outcome.with_created_window_finalization(wid)
         } else {
             outcome
         },
@@ -319,6 +312,20 @@ pub fn handle_window_frame_changed(
     }
     outcome = EventOutcome::layout_changed(false);
 
+    // External moves as well as resizes are authoritative for floating layouts.
+    // Requested frame acknowledgements have already been filtered by the classifier.
+    if let Some(space) = assigned_space.or(old_space)
+        && Some(space) == new_space
+        && let Some(workspace) = layout
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_for_window(&state.windows, space, wid)
+        && layout.layout_engine.virtual_workspace_manager().workspaces[workspace].layout_mode()
+            == crate::common::config::LayoutMode::Floating
+    {
+        layout.layout_engine.store_floating_position(space, workspace, wid, new_frame);
+    }
+
     let dragging = mouse_state == Some(MouseState::Down)
         || matches!(
             drag.drag_state,
@@ -472,7 +479,7 @@ pub fn handle_mouse_moved_over_window(
                 raise_windows: vec![vec![window]],
                 focus_window: Some((window, None)),
                 app_handles,
-                focus_quiet: Quiet::No,
+                focus_quiet: Quiet::Yes,
             },
         ));
     }
