@@ -5006,6 +5006,22 @@ fn window_server_destroy_after_ax_invalidation_removes_logical_window() {
 }
 
 #[test]
+fn window_closed_removes_logical_window_without_inventory_refresh() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let wid = WindowId::new(1, 1);
+
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(1));
+    let wsid = reactor.test_window_server_id(wid);
+
+    reactor.handle_event(Event::WindowClosed(wsid));
+
+    assert!(reactor.state.windows.record(wid).is_none());
+    assert!(!has_window_in_layout(&mut reactor, space, screen, wid));
+}
+
+#[test]
 fn app_termination_after_ax_invalidation_removes_logical_windows() {
     let (mut apps, mut reactor) = test_context_with_workspace_count(2);
     let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
@@ -6993,5 +7009,26 @@ fn moving_away_a_displays_only_workspace_leaves_it_showing_something() {
     assert!(
         reactor.layout_manager.layout_engine.active_workspace(middle).is_some(),
         "the display it was taken from must still have a workspace to show"
+    );
+}
+
+#[test]
+fn display_churn_release_still_flushes_the_deferred_inventory_refresh() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(2));
+    let _ = apps.requests();
+
+    reactor.handle_event(Event::DisplayChurnBegin);
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+
+    let requests = apps.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| matches!(request, Request::RefreshWindowInventory(_))),
+        "the first snapshot after display churn must still flush the deferred refresh: {requests:?}"
     );
 }
