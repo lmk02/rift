@@ -2355,3 +2355,62 @@ fn toggling_shared_across_displays_discards_the_incompatible_restored_topology()
         space
     ]);
 }
+
+#[test]
+fn a_shared_topology_saved_with_three_displays_loads_back_on_one() {
+    let shared = VirtualWorkspaceSettings {
+        shared_across_displays: true,
+        default_workspace_count: 6,
+        workspace_display_assignment: (2..6)
+            .map(|index| crate::common::config::WorkspaceDisplayAssignment {
+                workspace: crate::common::config::WorkspaceSelector::Index(index),
+                display: crate::common::config::DisplaySelector::Index(index / 2),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut engine = LayoutEngine::new(&shared, &LayoutSettings::default(), None);
+    let mut window_store = WindowStore::default();
+    let spaces: Vec<SpaceId> = (1..=3).map(SpaceId::new).collect();
+    let displays: Vec<crate::model::DisplaySlot> = spaces
+        .iter()
+        .enumerate()
+        .map(|(index, space)| crate::model::DisplaySlot {
+            space: *space,
+            uuid: Some(format!("display-{index}")),
+            size: CGSize::new(1000.0, 800.0),
+        })
+        .collect();
+    for slot in &displays {
+        let _ = engine.handle_event(
+            &mut window_store,
+            LayoutEvent::SpaceExposed(slot.space, slot.size),
+        );
+        engine.update_space_display(slot.space, slot.uuid.clone());
+    }
+    engine.apply_display_topology(&mut window_store, &displays, true);
+    let on_last: Vec<_> = engine.virtual_workspace_manager().existing_workspaces(spaces[2]);
+    assert_eq!(on_last.len(), 2);
+
+    let serialized = engine.serialize_to_string();
+    assert!(serialized.contains("\"shared_workspaces\":true"), "{serialized}");
+
+    // Reopened on the laptop alone.
+    let mut restored = LayoutEngine::deserialize_from_str(&serialized)
+        .expect("a shared topology has to survive the round trip");
+    restored.finish_loading(&shared, &LayoutSettings::default(), None);
+    restored.apply_display_topology(&mut window_store, &displays[..1], true);
+
+    let manager = restored.virtual_workspace_manager();
+    assert_eq!(manager.ordered_workspace_ids_global().len(), 6);
+    assert_eq!(manager.existing_workspaces(spaces[0]).len(), 6);
+    assert_eq!(manager.initialized_spaces(), vec![spaces[0]]);
+    assert_eq!(manager.validate_persisted_topology(), Ok(()));
+
+    // Docked again: the workspaces remember which display they came from, across the save.
+    restored.apply_display_topology(&mut window_store, &displays, true);
+    assert_eq!(
+        restored.virtual_workspace_manager().existing_workspaces(spaces[2]),
+        on_last
+    );
+}

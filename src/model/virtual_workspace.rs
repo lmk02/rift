@@ -1,4 +1,4 @@
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGRect, CGSize};
 use serde::{Deserialize, Serialize};
 use slotmap::{SlotMap, new_key_type};
 use tracing::{error, warn};
@@ -22,6 +22,31 @@ use crate::sys::screen::SpaceId;
 
 new_key_type! {
     pub struct VirtualWorkspaceId;
+}
+
+/// One attached display, as workspace reconciliation sees it.
+///
+/// A display in native fullscreen has its space nulled by the window server; it still gets
+/// a slot, carrying the last user space it showed, because it is attached and must keep
+/// both its workspaces and its position in `DisplaySelector::Index` order. A display that
+/// is actually gone has no slot at all - that absence is what triggers re-homing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplaySlot {
+    pub space: SpaceId,
+    pub uuid: Option<String>,
+    /// Unused by the workspace store; carried for the layout engine, which needs it to
+    /// re-key a moved workspace's layout onto the new screen.
+    pub size: CGSize,
+}
+
+/// One workspace changing owner, reported so callers can move the stores that key on
+/// `SpaceId` along with it.
+#[derive(Debug, Clone)]
+pub struct WorkspaceRelocation {
+    pub workspace: VirtualWorkspaceId,
+    pub old_space: SpaceId,
+    pub new_space: SpaceId,
+    pub windows: Vec<WindowId>,
 }
 
 impl std::fmt::Display for VirtualWorkspaceId {
@@ -175,6 +200,11 @@ pub struct WorkspaceStore {
     /// single value rather than one per space.
     #[serde(skip)]
     last_active_global: Option<VirtualWorkspaceId>,
+    /// Which display each workspace belongs on, by display UUID. Persisted, so unplugging
+    /// a monitor and plugging it back in - across a restart too - puts its workspaces back
+    /// instead of leaving them piled on whichever display survived.
+    #[serde(default)]
+    workspace_home_display: HashMap<VirtualWorkspaceId, String>,
 }
 
 impl Default for WorkspaceStore {
@@ -212,6 +242,7 @@ impl WorkspaceStore {
             shared_across_displays: config.shared_across_displays,
             display_assignment: config.workspace_display_assignment.clone(),
             last_active_global: None,
+            workspace_home_display: HashMap::default(),
         }
     }
 
@@ -247,7 +278,15 @@ impl WorkspaceStore {
 
         if self.shared_across_displays {
             // One global namespace: the pool is sized and named globally, not per display.
-            let Some(&home) = spaces.first() else {
+            // `spaces` is hash order, so the owner of the first workspace is used instead -
+            // otherwise a config reload that raises the count drops the new workspaces on
+            // whichever display the map happened to yield first.
+            let Some(home) = self
+                .global_workspace_order()
+                .first()
+                .map(|(_, space)| *space)
+                .or_else(|| spaces.first().copied())
+            else {
                 return;
             };
             while self.ordered_workspace_ids_global().len() < target_count {
@@ -438,36 +477,50 @@ impl WorkspaceStore {
 
     /// Reconciles the global workspace pool with the live display topology.
     ///
-    /// `visible` is every attached display's current space, in physical order. `retained`
-    /// names spaces that still belong to an attached display even though they are not
-    /// visible right now - a display in native fullscreen has its space nulled, and
-    /// treating that as "the display is gone" would re-home its workspaces and collapse
-    /// the configured split. Shared mode only; a no-op otherwise. Runs after `remap_space`
-    /// so it sees post-churn space ids.
+    /// `displays` is every attached display in physical order. A display that is gone
+    /// contributes no slot, and that absence is what tells this pass to re-home its
+    /// workspaces; a display merely in native fullscreen keeps its slot (see
+    /// [`DisplaySlot`]). `display_set_changed` separates a plug/unplug from an ordinary
+    /// space update: the configured assignment and the remembered homes are enforced only
+    /// on the former, so a manual `move_workspace_to_display` survives the next space
+    /// change.
+    ///
+    /// Returns every ownership transfer so the caller can move the stores that key on
+    /// `SpaceId` along with it. Shared mode only; a no-op otherwise. Runs after
+    /// `remap_space` so it sees post-churn space ids.
     pub fn apply_display_topology(
         &mut self,
         window_store: &mut WindowStore,
-        visible: &[(SpaceId, Option<String>)],
-        retained: &[SpaceId],
-    ) {
+        displays: &[DisplaySlot],
+        display_set_changed: bool,
+    ) -> Vec<WorkspaceRelocation> {
+        let mut moves = Vec::new();
         if !self.shared_across_displays {
-            return;
+            return moves;
         }
-        let Some(&(home, _)) = visible.first() else {
-            return;
+        let Some(home) = displays.first().map(|slot| slot.space) else {
+            return moves;
         };
+        // A display owning nothing has either just been plugged in or has never been
+        // reconciled, whatever the caller believes about the display set. Either way the
+        // configured split has to be established for it.
+        let newly_attached =
+            displays.iter().any(|slot| self.ordered_workspace_ids(slot.space).is_empty());
 
-        // The pool is created once, in config order, so global indices are deterministic
-        // rather than depending on which display rift happened to see first.
-        let target_count = self.default_workspace_count.max(1).min(self.max_workspaces);
+        // Every attached display has to be able to show something, so the pool is never
+        // smaller than the display count. It is created in one place, in config order, so
+        // global indices are deterministic rather than depending on which display rift
+        // happened to see first.
+        let target_count =
+            self.default_workspace_count.max(displays.len()).max(1).min(self.max_workspaces);
         while self.ordered_workspace_ids_global().len() < target_count {
             let index = self.ordered_workspace_ids_global().len();
             self.push_default_workspace(home, index);
         }
         // Only meaningful when the pool was just created here. `home` can own nothing -
-        // a fullscreen transition nulls a display's space, so a space that owns no
-        // workspaces can become the first one in physical order while the pool is already
-        // full. `ensure_every_display_owns_a_workspace` below settles that case.
+        // a display plugged in to the left of the others becomes first in physical order
+        // while the pool is already full - and
+        // `ensure_every_display_owns_a_workspace` below settles that case.
         let owned_by_home = self.ordered_workspace_ids(home);
         if let Some(default) = owned_by_home
             .get(self.default_workspace)
@@ -477,15 +530,110 @@ impl WorkspaceStore {
             self.active_workspace_per_space.entry(home).or_insert((None, default));
         }
 
-        self.apply_display_assignment(window_store, visible);
-        self.rehome_detached_workspaces(window_store, home, visible, retained);
-        self.ensure_every_display_owns_a_workspace(window_store, visible);
+        self.seed_missing_homes(displays);
+        if display_set_changed || newly_attached {
+            // Memory first, config second: an explicit `workspace_display_assignment` is
+            // the user's stated intent and outranks where the workspace last happened to be.
+            self.reclaim_remembered_displays(window_store, displays, &mut moves);
+            self.apply_display_assignment(window_store, displays, &mut moves);
+        }
+        self.rehome_detached_workspaces(window_store, home, displays, &mut moves);
+        self.ensure_every_display_owns_a_workspace(window_store, displays, &mut moves);
+        self.forget_empty_owners();
+        moves
+    }
+
+    /// `relocate_workspace`, recording the transfer for the caller.
+    fn relocate_tracked(
+        &mut self,
+        window_store: &mut WindowStore,
+        workspace: VirtualWorkspaceId,
+        new_space: SpaceId,
+        moves: &mut Vec<WorkspaceRelocation>,
+    ) {
+        let Some(old_space) = self.workspaces.get(workspace).map(|ws| ws.space) else {
+            return;
+        };
+        if old_space == new_space {
+            return;
+        }
+        let windows = self.relocate_workspace(window_store, workspace, new_space);
+        moves.push(WorkspaceRelocation {
+            workspace,
+            old_space,
+            new_space,
+            windows,
+        });
+    }
+
+    /// Records where a workspace belongs, so it can be pulled back when that display
+    /// returns. Called for deliberate placements only - re-homing a stranded workspace
+    /// must leave the memory of the display that went away intact.
+    pub(crate) fn remember_home(
+        &mut self,
+        workspace: VirtualWorkspaceId,
+        display_uuid: Option<String>,
+    ) {
+        match display_uuid {
+            Some(uuid) => {
+                self.workspace_home_display.insert(workspace, uuid);
+            }
+            None => {
+                self.workspace_home_display.remove(&workspace);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn home_display(&self, workspace: VirtualWorkspaceId) -> Option<&str> {
+        self.workspace_home_display.get(&workspace).map(String::as_str)
+    }
+
+    /// Adopts the current owner as the home of any workspace that has none yet - a fresh
+    /// pool, or one restored from a file written before homes were recorded. `or_insert`
+    /// is the point: a workspace that was re-homed off a display that went away still
+    /// remembers that display and must not be re-seeded to its temporary owner.
+    fn seed_missing_homes(&mut self, displays: &[DisplaySlot]) {
+        for slot in displays {
+            let Some(uuid) = slot.uuid.clone() else {
+                continue;
+            };
+            for workspace in self.ordered_workspace_ids(slot.space) {
+                self.workspace_home_display.entry(workspace).or_insert_with(|| uuid.clone());
+            }
+        }
+    }
+
+    /// Pulls every workspace that remembers an attached display back onto it.
+    fn reclaim_remembered_displays(
+        &mut self,
+        window_store: &mut WindowStore,
+        displays: &[DisplaySlot],
+        moves: &mut Vec<WorkspaceRelocation>,
+    ) {
+        for slot in displays {
+            let Some(uuid) = slot.uuid.as_deref() else {
+                continue;
+            };
+            let mut wanted: Vec<VirtualWorkspaceId> = self
+                .workspace_home_display
+                .iter()
+                .filter(|(_, home)| home.as_str() == uuid)
+                .map(|(workspace, _)| *workspace)
+                .collect();
+            // Global index order, so the result does not depend on hash iteration order.
+            wanted.sort_unstable();
+            for workspace in wanted {
+                self.relocate_tracked(window_store, workspace, slot.space, moves);
+            }
+        }
     }
 
     fn apply_display_assignment(
         &mut self,
         window_store: &mut WindowStore,
-        visible: &[(SpaceId, Option<String>)],
+        displays: &[DisplaySlot],
+        moves: &mut Vec<WorkspaceRelocation>,
     ) {
         for assignment in self.display_assignment.clone() {
             let workspace = match &assignment.workspace {
@@ -497,17 +645,20 @@ impl WorkspaceStore {
                     .into_iter()
                     .find(|id| self.workspaces.get(*id).is_some_and(|ws| &ws.name == name)),
             };
-            let space = match &assignment.display {
-                DisplaySelector::Index(index) => visible.get(*index).map(|(space, _)| *space),
-                DisplaySelector::Uuid(uuid) => visible
-                    .iter()
-                    .find(|(_, candidate)| candidate.as_deref() == Some(uuid.as_str()))
-                    .map(|(space, _)| *space),
+            // Indices address attached displays in physical order, including one that is
+            // currently in fullscreen - dropping it would silently shift every display
+            // after it onto the wrong assignment.
+            let slot = match &assignment.display {
+                DisplaySelector::Index(index) => displays.get(*index),
+                DisplaySelector::Uuid(uuid) => {
+                    displays.iter().find(|slot| slot.uuid.as_deref() == Some(uuid.as_str()))
+                }
                 // Rejected by config validation; neither names a stable owner.
                 DisplaySelector::Direction(_) | DisplaySelector::Cycle(_) => None,
             };
-            if let (Some(workspace), Some(space)) = (workspace, space) {
-                self.relocate_workspace(window_store, workspace, space);
+            if let (Some(workspace), Some(slot)) = (workspace, slot) {
+                self.relocate_tracked(window_store, workspace, slot.space, moves);
+                self.remember_home(workspace, slot.uuid.clone());
             }
         }
     }
@@ -518,19 +669,18 @@ impl WorkspaceStore {
         &mut self,
         window_store: &mut WindowStore,
         home: SpaceId,
-        visible: &[(SpaceId, Option<String>)],
-        retained: &[SpaceId],
+        displays: &[DisplaySlot],
+        moves: &mut Vec<WorkspaceRelocation>,
     ) {
         let detached: Vec<SpaceId> = self
             .workspaces_by_space
             .keys()
             .copied()
-            .filter(|space| !visible.iter().any(|(visible, _)| visible == space))
-            .filter(|space| !retained.contains(space))
+            .filter(|space| !displays.iter().any(|slot| slot.space == *space))
             .collect();
         for space in detached {
             for workspace in self.ordered_workspace_ids(space) {
-                self.relocate_workspace(window_store, workspace, home);
+                self.relocate_tracked(window_store, workspace, home, moves);
             }
             self.workspaces_by_space.remove(&space);
             self.active_workspace_per_space.remove(&space);
@@ -540,34 +690,86 @@ impl WorkspaceStore {
     fn ensure_every_display_owns_a_workspace(
         &mut self,
         window_store: &mut WindowStore,
-        visible: &[(SpaceId, Option<String>)],
+        displays: &[DisplaySlot],
+        moves: &mut Vec<WorkspaceRelocation>,
     ) {
-        for &(space, _) in visible {
-            if !self.ordered_workspace_ids(space).is_empty() {
-                if let Some(first) = self.ordered_workspace_ids(space).first().copied() {
-                    self.active_workspace_per_space.entry(space).or_insert((None, first));
-                }
-                continue;
+        for slot in displays {
+            if let Some(relocation) =
+                self.donate_workspace_to(window_store, slot.space, slot.uuid.as_deref(), None)
+            {
+                moves.push(relocation);
             }
-            let donor = self
-                .workspaces_by_space
-                .iter()
-                .filter(|(owner, ids)| **owner != space && ids.len() > 1)
-                .max_by_key(|(_, ids)| ids.len())
-                .map(|(owner, _)| *owner);
-            let Some(donor) = donor else {
-                continue;
-            };
-            let Some(moved) = self
-                .ordered_workspace_ids(donor)
-                .into_iter()
-                .rev()
-                .find(|id| self.active_workspace(donor) != Some(*id))
-            else {
-                continue;
-            };
-            self.relocate_workspace(window_store, moved, space);
         }
+    }
+
+    /// Hands `space` a workspace from the display that can best spare one, when it owns
+    /// none. A display with no workspace can never be switched to or arranged, so it just
+    /// sits there showing whatever was on it last.
+    ///
+    /// Also used after a workspace is moved off a display by hand, which is the other way
+    /// a display ends up owning nothing.
+    /// `except` is the workspace that was just moved off `space`; donating it straight
+    /// back would undo the move.
+    pub(crate) fn donate_workspace_to(
+        &mut self,
+        window_store: &mut WindowStore,
+        space: SpaceId,
+        uuid: Option<&str>,
+        except: Option<VirtualWorkspaceId>,
+    ) -> Option<WorkspaceRelocation> {
+        if !self.shared_across_displays {
+            return None;
+        }
+        if let Some(first) = self.ordered_workspace_ids(space).first().copied() {
+            self.active_workspace_per_space.entry(space).or_insert((None, first));
+            return None;
+        }
+        // Biggest owner donates, ties broken by space id rather than hash order, so three
+        // equally loaded displays do not produce a different answer per run.
+        let mut candidates: Vec<(SpaceId, usize)> = self
+            .workspaces_by_space
+            .iter()
+            .filter(|(owner, ids)| **owner != space && ids.len() > 1)
+            .map(|(owner, ids)| (*owner, ids.len()))
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.get().cmp(&b.0.get())));
+        let (donor, _) = candidates.first().copied()?;
+        // Prefer a workspace the donor is not currently showing. When it only has the one
+        // it is showing left to give, hand that over rather than leave a display blank -
+        // the donor keeps a workspace either way, because it owns more than one.
+        let candidates = self.ordered_workspace_ids(donor);
+        let moved = candidates
+            .iter()
+            .rev()
+            .find(|id| self.active_workspace(donor) != Some(**id) && except != Some(**id))
+            .or_else(|| candidates.iter().rev().find(|id| except != Some(**id)))
+            .copied()?;
+
+        let mut moves = Vec::new();
+        self.relocate_tracked(window_store, moved, space, &mut moves);
+        // A donation is a deliberate placement: this display is where that workspace now
+        // lives, and where it should come back to.
+        self.remember_home(moved, uuid.map(str::to_string));
+        moves.pop()
+    }
+
+    /// Drops owner slots that ended up with no workspaces, and homes for workspaces that no
+    /// longer exist. `validate_persisted_topology` refuses to load a space that owns
+    /// nothing, so leaving one behind would make the next launch discard the layout file.
+    fn forget_empty_owners(&mut self) {
+        let empty: Vec<SpaceId> = self
+            .workspaces_by_space
+            .iter()
+            .filter(|(_, ids)| ids.is_empty())
+            .map(|(space, _)| *space)
+            .collect();
+        for space in empty {
+            self.workspaces_by_space.remove(&space);
+            self.active_workspace_per_space.remove(&space);
+        }
+        let workspaces = &self.workspaces;
+        self.workspace_home_display
+            .retain(|workspace, _| workspaces.contains_key(*workspace));
     }
 
     fn repair_active_after_relocate(
@@ -1632,19 +1834,31 @@ mod tests {
         WorkspaceStore::new_with_config(&config, &LayoutSettings::default())
     }
 
+    /// Attached displays in physical order. Each gets a stable UUID derived from its
+    /// space, which is what the home-display memory keys on.
+    fn slots(spaces: &[SpaceId]) -> Vec<DisplaySlot> {
+        spaces
+            .iter()
+            .map(|space| DisplaySlot {
+                space: *space,
+                uuid: Some(format!("display-{}", space.get())),
+                size: CGSize::new(1000., 1000.),
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_display_that_owns_no_workspaces_does_not_panic_when_the_pool_is_full() {
-        // Entering or leaving native fullscreen nulls a display's space and can make a
-        // different space the first one in physical order. That space owns nothing, and
-        // the global pool is already full, so nothing is created for it either.
+    fn a_newly_attached_display_is_given_a_workspace_from_the_full_pool() {
+        // The pool is already full, so nothing is created for the newcomer; it has to be
+        // handed one of the existing workspaces or it shows nothing at all.
         let mut store = shared_store(4);
         let mut windows = WindowStore::default();
         let first = SpaceId::new(1);
-        store.apply_display_topology(&mut windows, &[(first, None)], &[]);
+        store.apply_display_topology(&mut windows, &slots(&[first]), true);
         assert_eq!(store.ordered_workspace_ids_global().len(), 4);
 
         let newcomer = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(newcomer, None)], &[]);
+        store.apply_display_topology(&mut windows, &slots(&[first, newcomer]), true);
 
         assert_eq!(
             store.ordered_workspace_ids_global().len(),
@@ -1653,40 +1867,152 @@ mod tests {
         );
         assert!(
             store.active_workspace(newcomer).is_some(),
-            "the visible display still has to be showing something"
+            "every attached display has to be showing something"
         );
     }
 
     #[test]
-    fn a_display_in_fullscreen_does_not_lose_its_workspaces() {
-        // While a display is in native fullscreen its `screen.space` is nulled, so it is
-        // absent from the visible list. That is not the same as the display being gone,
-        // and re-homing its workspaces would collapse the configured split.
-        let mut store = shared_store(10);
-        store.display_assignment = (5..10)
+    fn the_pool_grows_to_cover_more_displays_than_configured_workspaces() {
+        // Two workspaces, four displays: without growing the pool two of them would own
+        // nothing, show nothing, and leave an empty owner slot that
+        // `validate_persisted_topology` refuses to load on the next launch.
+        let mut store = shared_store(2);
+        let mut windows = WindowStore::default();
+        let displays: Vec<SpaceId> = (1..=4).map(SpaceId::new).collect();
+
+        store.apply_display_topology(&mut windows, &slots(&displays), true);
+
+        assert_eq!(store.ordered_workspace_ids_global().len(), 4);
+        for space in &displays {
+            assert!(
+                store.active_workspace(*space).is_some(),
+                "display {space:?} owns nothing"
+            );
+        }
+        assert_eq!(store.validate_persisted_topology(), Ok(()));
+    }
+
+    #[test]
+    fn display_assignment_indexes_attached_displays_not_just_the_ones_showing_a_space() {
+        // A display in native fullscreen keeps its slot, carrying the last user space it
+        // showed. Dropping it would shift every display after it by one and silently
+        // retarget the configured assignment - invisible with two displays, wrong with
+        // three.
+        let mut store = shared_store(9);
+        store.display_assignment = (6..9)
+            .map(|index| WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(index),
+                display: DisplaySelector::Index(2),
+            })
+            .collect();
+        let mut windows = WindowStore::default();
+        let (left, middle, right) = (SpaceId::new(1), SpaceId::new(2), SpaceId::new(3));
+
+        store.apply_display_topology(&mut windows, &slots(&[left, middle, right]), true);
+
+        assert_eq!(store.ordered_workspace_ids(right).len(), 3);
+        for index in 6..9 {
+            assert_eq!(
+                store.workspace_at_global_index(index).map(|(_, space)| space),
+                Some(right),
+                "index {index} belongs on the third display"
+            );
+        }
+    }
+
+    #[test]
+    fn detaching_the_middle_display_rehomes_it_and_replugging_takes_it_back() {
+        let mut store = shared_store(9);
+        store.display_assignment = (3..6)
             .map(|index| WorkspaceDisplayAssignment {
                 workspace: WorkspaceSelector::Index(index),
                 display: DisplaySelector::Index(1),
             })
+            .chain((6..9).map(|index| WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(index),
+                display: DisplaySelector::Index(2),
+            }))
             .collect();
         let mut windows = WindowStore::default();
-        let left = SpaceId::new(1);
-        let right = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
-        assert_eq!(store.ordered_workspace_ids(left).len(), 5);
+        let (left, middle, right) = (SpaceId::new(1), SpaceId::new(2), SpaceId::new(3));
+        store.apply_display_topology(&mut windows, &slots(&[left, middle, right]), true);
+        let on_middle: Vec<_> = store.ordered_workspace_ids(middle);
+        assert_eq!(on_middle.len(), 3);
 
-        // Left enters fullscreen: still attached, but its user space is not visible.
-        store.apply_display_topology(&mut windows, &[(right, None)], &[left]);
+        // Unplugged. The config still names display index 1, which is now the right-hand
+        // display, so the assignment must not be what pulls these back later.
+        store.display_assignment.clear();
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
 
-        assert_eq!(
-            store.ordered_workspace_ids(left).len(),
-            5,
-            "a display that is merely in fullscreen must keep its workspaces"
-        );
-        assert_eq!(
-            store.workspace_at_global_index(0).map(|(_, space)| space),
-            Some(left)
-        );
+        for workspace in &on_middle {
+            assert_eq!(
+                store.workspace_space(*workspace),
+                Some(left),
+                "a stranded workspace has to land on an attached display"
+            );
+        }
+        assert!(store.workspaces_by_space.get(&middle).is_none());
+        assert!(store.active_workspace(middle).is_none());
+        assert_eq!(store.ordered_workspace_ids_global().len(), 9);
+        assert_eq!(store.validate_persisted_topology(), Ok(()));
+
+        // Replugged, with a fresh space id the way macOS hands them out.
+        let middle_again = SpaceId::new(20);
+        let mut replugged = slots(&[left, middle, right]);
+        replugged[1].space = middle_again;
+        store.apply_display_topology(&mut windows, &replugged, true);
+
+        for workspace in &on_middle {
+            assert_eq!(
+                store.workspace_space(*workspace),
+                Some(middle_again),
+                "a workspace has to return to the display it belongs on"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manual_move_survives_an_ordinary_space_update_and_a_replug() {
+        let mut store = shared_store(4);
+        let mut windows = WindowStore::default();
+        let (left, right) = (SpaceId::new(1), SpaceId::new(2));
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
+        let (moved, _) = store.workspace_at_global_index(0).unwrap();
+
+        // What `move_workspace_to_display` does: relocate, then record the new home.
+        store.relocate_workspace(&mut windows, moved, right);
+        store.remember_home(moved, Some("display-2".to_string()));
+
+        // An ordinary space change must not undo it.
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), false);
+        assert_eq!(store.workspace_space(moved), Some(right));
+
+        // Nor must unplugging and replugging the display it came from.
+        store.apply_display_topology(&mut windows, &slots(&[right]), true);
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
+        assert_eq!(store.workspace_space(moved), Some(right));
+        assert_eq!(store.home_display(moved), Some("display-2"));
+    }
+
+    #[test]
+    fn a_configured_assignment_outranks_where_a_workspace_was_last_moved() {
+        let mut store = shared_store(4);
+        store.display_assignment = vec![WorkspaceDisplayAssignment {
+            workspace: WorkspaceSelector::Index(0),
+            display: DisplaySelector::Index(0),
+        }];
+        let mut windows = WindowStore::default();
+        let (left, right) = (SpaceId::new(1), SpaceId::new(2));
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
+        let (pinned, _) = store.workspace_at_global_index(0).unwrap();
+
+        store.relocate_workspace(&mut windows, pinned, right);
+        store.remember_home(pinned, Some("display-2".to_string()));
+
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
+
+        assert_eq!(store.workspace_space(pinned), Some(left));
+        assert_eq!(store.home_display(pinned), Some("display-1"));
     }
 
     #[test]
@@ -1696,7 +2022,7 @@ mod tests {
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
 
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
 
         assert_eq!(store.ordered_workspace_ids_global().len(), 6);
         assert_eq!(
@@ -1728,7 +2054,7 @@ mod tests {
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
 
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
 
         let (workspace, owner) = store.workspace_at_global_index(4).unwrap();
         assert_eq!(owner, right);
@@ -1744,7 +2070,7 @@ mod tests {
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
 
         let (workspace, owner) = store.workspace_at_global_index(0).unwrap();
         assert_eq!(owner, left);
@@ -1777,10 +2103,10 @@ mod tests {
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
         let (stranded, _) = store.workspace_at_global_index(5).unwrap();
 
-        store.apply_display_topology(&mut windows, &[(left, None)], &[]);
+        store.apply_display_topology(&mut windows, &slots(&[left]), true);
 
         assert_eq!(store.workspace_at_global_index(5), Some((stranded, left)));
         assert_eq!(store.ordered_workspace_ids_global().len(), 6);
@@ -1803,7 +2129,7 @@ mod tests {
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
 
         let last_on_left = store.workspace_at_global_index(1).unwrap().0;
         assert_eq!(
@@ -1854,7 +2180,7 @@ mod tests {
         let mut windows = WindowStore::default();
         let left = SpaceId::new(1);
         let right = SpaceId::new(2);
-        store.apply_display_topology(&mut windows, &[(left, None), (right, None)], &[]);
+        store.apply_display_topology(&mut windows, &slots(&[left, right]), true);
         let (third, owner) = store.workspace_at_global_index(2).unwrap();
         assert_eq!(owner, left);
 

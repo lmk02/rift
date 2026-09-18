@@ -197,9 +197,12 @@ impl VirtualWorkspaceSettings {
                     index, self.default_workspace_count
                 ));
             }
-            if matches!(assignment.display, DisplaySelector::Direction(_)) {
+            if matches!(
+                assignment.display,
+                DisplaySelector::Direction(_) | DisplaySelector::Cycle(_)
+            ) {
                 issues.push(
-                    "workspace_display_assignment display must be an index or a display UUID,                      not a direction"
+                    "workspace_display_assignment display must be an index or a display UUID,                      not a direction or next/prev"
                         .to_string(),
                 );
             }
@@ -1788,6 +1791,7 @@ mod tests {
             workspace_display_assignment = [
                 { workspace = 7, display = 1 },
                 { workspace = 0, display = "left" },
+                { workspace = 1, display = "next" },
             ]
             "#,
         )
@@ -1798,8 +1802,14 @@ mod tests {
             issues.iter().any(|issue| issue.contains("only 4 workspaces exist")),
             "{issues:?}"
         );
-        assert!(
-            issues.iter().any(|issue| issue.contains("not a direction")),
+        // "left" and "next" both parse - `DisplaySelector` is untagged - and both name a
+        // display that changes with the focus, so neither can own a workspace.
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|issue| issue.contains("not a direction or next/prev"))
+                .count(),
+            2,
             "{issues:?}"
         );
     }

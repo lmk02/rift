@@ -6720,3 +6720,278 @@ fn dragging_a_floating_window_across_displays_keeps_it_floating() {
         "a floating window dragged to another display must not become tiled"
     );
 }
+
+// ---- display hotplug with shared workspaces ---------------------------------------------
+
+/// `display_count` displays side by side, sharing one pool of `count` workspaces split
+/// evenly between them. Display `i` shows space `i + 1` and is named `test-display-{i}`,
+/// which is what `make_screen_snapshots` produces.
+fn shared_reactor(display_count: usize, count: usize) -> (Reactor, Vec<SpaceId>) {
+    let settings = crate::common::config::VirtualWorkspaceSettings {
+        shared_across_displays: true,
+        default_workspace_count: count,
+        workspace_names: Vec::new(),
+        workspace_display_assignment: (0..count)
+            .map(|index| crate::common::config::WorkspaceDisplayAssignment {
+                workspace: WorkspaceSelector::Index(index),
+                display: crate::common::config::DisplaySelector::Index(
+                    index * display_count / count,
+                ),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut reactor = test_reactor_with_workspace_settings(&settings);
+    reactor.config.virtual_workspaces = settings;
+
+    let spaces: Vec<SpaceId> = (1..=display_count).map(|id| SpaceId::new(id as u64)).collect();
+    let present: Vec<(usize, SpaceId)> = spaces
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(display, space)| (display, space))
+        .collect();
+    plug_displays(&mut reactor, &present);
+    (reactor, spaces)
+}
+
+/// Reports a new display set the way the spaces actor does after a plug or unplug: the
+/// surviving displays keep their UUID and their physical position, and the snapshot carries
+/// the topology flags plus the display-to-space history that tells a fullscreen display
+/// apart from one that is gone.
+fn plug_displays(reactor: &mut Reactor, present: &[(usize, SpaceId)]) {
+    let screens: Vec<ScreenInfo> = present
+        .iter()
+        .map(|&(display, space)| ScreenInfo {
+            id: crate::sys::screen::ScreenId::new(display as u32),
+            frame: CGRect::new(
+                CGPoint::new(display as f64 * 1000., 0.),
+                CGSize::new(1000., 1000.),
+            ),
+            space: Some(space),
+            display_uuid: format!("test-display-{display}"),
+            name: None,
+        })
+        .collect();
+    let mut state = forwarded_space_state(screens);
+    state.display_set_changed = true;
+    state.topology_changed = true;
+    state.should_force_refresh_layout = true;
+    for screen in &state.screens {
+        if let Some(space) = screen.space {
+            state.last_user_space_by_display.insert(screen.display_uuid.clone(), space);
+        }
+    }
+    reactor.handle_event(Event::SpaceStateChanged(state));
+    for &(_, space) in present {
+        reactor.send_layout_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 1000.)));
+    }
+}
+
+/// Windows laid out for a workspace that is not the active one, which is where a re-homed
+/// workspace lands. Empty if its layout tree was left behind under the old space.
+fn workspace_layout(
+    reactor: &Reactor,
+    space: SpaceId,
+    workspace: crate::model::VirtualWorkspaceId,
+) -> Vec<(WindowId, CGRect)> {
+    let screen = reactor
+        .space_state
+        .screens
+        .iter()
+        .find(|screen| screen.space == Some(space))
+        .expect("the space is on an attached display");
+    reactor.layout_manager.layout_engine.calculate_layout_for_workspace(
+        &reactor.state.windows,
+        space,
+        workspace,
+        screen.frame,
+        &reactor
+            .config
+            .settings
+            .layout
+            .gaps
+            .effective_for_display(screen.display_uuid_opt()),
+        reactor.config.settings.ui.stack_line.thickness(),
+        reactor.config.settings.ui.stack_line.horiz_placement,
+        reactor.config.settings.ui.stack_line.vert_placement,
+    )
+}
+
+fn seed_windows(reactor: &mut Reactor, pid: pid_t, space: SpaceId, count: u32) -> Vec<WindowId> {
+    reactor.add_test_app(pid);
+    let workspace = reactor
+        .layout_manager
+        .layout_engine
+        .active_workspace(space)
+        .expect("the display shows a workspace");
+    (0..count)
+        .map(|index| {
+            let window = WindowId::new(pid, index + 1);
+            reactor.add_test_window(
+                window,
+                WindowServerId::new(pid as u32 * 100 + index + 1),
+                Some(space),
+                CGRect::new(CGPoint::new(100., 100.), CGSize::new(300., 200.)),
+            );
+            assert!(reactor.assign_test_window_to_workspace(space, window, workspace));
+            reactor.send_layout_event(LayoutEvent::WindowAdded(space, window));
+            window
+        })
+        .collect()
+}
+
+#[test]
+fn unplugging_a_display_rehomes_its_workspaces_with_their_windows_and_layout() {
+    // The last display goes away, so its configured index names nothing and re-homing is
+    // what has to move its workspaces. (An index in the middle of the set would instead
+    // shift onto the next display, which is what "display index in physical order" means.)
+    let (mut reactor, spaces) = shared_reactor(3, 9);
+    let (left, last) = (spaces[0], spaces[2]);
+    let (stranded, owner) = global_workspace(&reactor, 6);
+    assert_eq!(owner, last, "workspaces 6..9 start on the last display");
+    let windows = seed_windows(&mut reactor, 2, last, 2);
+    assert_eq!(workspace_layout(&reactor, last, stranded).len(), 2);
+
+    plug_displays(&mut reactor, &[(0, spaces[0]), (1, spaces[1])]);
+
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_space(stranded),
+        Some(left),
+        "a workspace on a display that went away has to land on one that is still there"
+    );
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_windows(&reactor.state.windows, left, stranded),
+        windows,
+        "its windows must resolve under the new space or they arrange nowhere"
+    );
+    assert_eq!(
+        workspace_layout(&reactor, left, stranded).len(),
+        2,
+        "the layout tree has to move with the workspace, not stay keyed to the dead space"
+    );
+}
+
+#[test]
+fn replugging_a_display_takes_its_workspaces_back() {
+    let (mut reactor, spaces) = shared_reactor(3, 9);
+    let middle = spaces[1];
+    let on_middle: Vec<_> = (3..6).map(|index| global_workspace(&reactor, index).0).collect();
+    let windows = seed_windows(&mut reactor, 2, middle, 1);
+
+    plug_displays(&mut reactor, &[(0, spaces[0]), (2, spaces[2])]);
+    // macOS hands a reconnected display a space id it has never used before.
+    let middle_again = SpaceId::new(40);
+    plug_displays(&mut reactor, &[
+        (0, spaces[0]),
+        (1, middle_again),
+        (2, spaces[2]),
+    ]);
+
+    let manager = reactor.layout_manager.layout_engine.virtual_workspace_manager();
+    for workspace in &on_middle {
+        assert_eq!(
+            manager.workspace_space(*workspace),
+            Some(middle_again),
+            "the workspaces have to come back to the display they belong on"
+        );
+    }
+    assert_eq!(
+        reactor
+            .state
+            .windows
+            .workspace_info_for_window(windows[0])
+            .map(|info| info.space),
+        Some(middle_again),
+        "and take their windows with them"
+    );
+}
+
+#[test]
+fn a_moved_workspace_stays_put_across_an_ordinary_space_update() {
+    let (mut reactor, spaces) = shared_reactor(3, 9);
+    let (left, middle) = (spaces[0], spaces[1]);
+    let (moved, owner) = global_workspace(&reactor, 4);
+    assert_eq!(owner, middle);
+
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::MoveWorkspaceToDisplay {
+            selector: crate::common::config::DisplaySelector::Index(0),
+            workspace: Some(4),
+            wrap_around: false,
+        },
+    )));
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_space(moved),
+        Some(left)
+    );
+
+    // An ordinary space snapshot: same displays, nothing plugged or unplugged.
+    reactor.handle_event(space_state_event(
+        (0..3)
+            .map(|display| {
+                CGRect::new(
+                    CGPoint::new(display as f64 * 1000., 0.),
+                    CGSize::new(1000., 1000.),
+                )
+            })
+            .collect(),
+        spaces.iter().copied().map(Some).collect(),
+    ));
+
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_space(moved),
+        Some(left),
+        "the configured assignment must not snap a hand-moved workspace back"
+    );
+}
+
+#[test]
+fn moving_away_a_displays_only_workspace_leaves_it_showing_something() {
+    // Three displays, three workspaces: one each, so the source display is emptied by the
+    // move and has to be given one back.
+    let (mut reactor, spaces) = shared_reactor(3, 3);
+    let (left, middle) = (spaces[0], spaces[1]);
+    let (moved, owner) = global_workspace(&reactor, 1);
+    assert_eq!(owner, middle);
+    assert_eq!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .ordered_workspace_ids_global()
+            .len(),
+        3
+    );
+
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::MoveWorkspaceToDisplay {
+            selector: crate::common::config::DisplaySelector::Index(0),
+            workspace: Some(1),
+            wrap_around: false,
+        },
+    )));
+
+    let manager = reactor.layout_manager.layout_engine.virtual_workspace_manager();
+    assert_eq!(manager.workspace_space(moved), Some(left));
+    assert!(
+        reactor.layout_manager.layout_engine.active_workspace(middle).is_some(),
+        "the display it was taken from must still have a workspace to show"
+    );
+}

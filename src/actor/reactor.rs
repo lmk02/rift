@@ -2965,7 +2965,7 @@ impl Reactor {
                 .layout_engine
                 .update_space_display(space, Some(display_uuid.to_string()));
         }
-        self.apply_shared_workspace_topology();
+        outcome.absorb(self.apply_shared_workspace_topology(display_set_changed));
         let current_screens = self.space_state.screens.clone();
         self.space_activation_policy
             .on_spaces_updated(activation_config, &current_screens);
@@ -5360,24 +5360,27 @@ impl Reactor {
             (destination, moved)
         };
 
+        // Handing over a display's last workspace would leave it with nothing to show
+        // until the next display change, so it is given one back.
+        let donated = if shared {
+            let source_size = self
+                .space_state
+                .screen_by_space(source_space)
+                .map(|screen| screen.frame.size)
+                .unwrap_or(target_screen.frame.size);
+            self.layout_manager.layout_engine.backfill_display_workspace(
+                &mut self.state.windows,
+                source_space,
+                source_size,
+                Some(target_workspace),
+            )
+        } else {
+            Vec::new()
+        };
+
         let mut outcome = EventOutcome::layout_changed(false).with_arrange_space_scope(None);
-        for window in windows {
-            let Some(state) = self.state.windows.window(window) else {
-                continue;
-            };
-            let window_server_id = state.info.sys_id;
-            // Writing the frame onto the target screen is what actually makes macOS
-            // reparent the window; the arrange pass then lays it out properly.
-            let frame = Self::center_frame_on_screen(state.frame_monotonic, target_screen.frame);
-            if let Some(window_state) = self.state.windows.window_mut(window) {
-                window_state.frame_monotonic = frame;
-            }
-            if let Some(window_server_id) = window_server_id {
-                self.state.windows.set_window_server_space(window_server_id, Some(target_space));
-                self.state.windows.mark_window_visible(window_server_id);
-            }
-            outcome = outcome.with_pre_layout_window_frame_write(window, frame, true);
-        }
+        let moved = windows.into_iter().map(|window| (window, target_space)).chain(donated);
+        self.place_windows_on_their_screens(moved, &mut outcome);
 
         // Show what was just moved, rather than leaving it parked behind whatever the
         // target display happened to be on.
@@ -5577,26 +5580,72 @@ impl Reactor {
     /// Reconciles the shared workspace pool with the attached displays. No-op unless
     /// `shared_across_displays` is on. Must run after `remap_space` so it sees post-churn
     /// space ids, and after `update_space_display` so display UUIDs are current.
-    fn apply_shared_workspace_topology(&mut self) {
+    fn apply_shared_workspace_topology(&mut self, display_set_changed: bool) -> EventOutcome {
+        let mut outcome = EventOutcome::no_change();
         if !self.config.virtual_workspaces.shared_across_displays {
-            return;
+            return outcome;
         }
-        let visible: Vec<(SpaceId, Option<String>)> = self
+        // One slot per *attached* display, in physical order. A display in native
+        // fullscreen has its space nulled, so it falls back to the last user space it
+        // showed: it is still attached, it keeps its workspaces, and it keeps its place in
+        // `DisplaySelector::Index` order. Only a display that is really gone is missing
+        // here, which is what re-homing keys off.
+        let displays: Vec<crate::model::DisplaySlot> = self
             .screens_in_physical_order()
             .into_iter()
             .filter_map(|screen| {
-                Some((screen.space?, screen.display_uuid_opt().map(str::to_string)))
+                let uuid = screen.display_uuid_opt();
+                let space = screen
+                    .space
+                    .or_else(|| self.space_state.last_user_space_by_display.get(uuid?).copied())?;
+                Some(crate::model::DisplaySlot {
+                    space,
+                    uuid: uuid.map(str::to_string),
+                    size: screen.frame.size,
+                })
             })
             .collect();
-        // A display in native fullscreen has its space nulled, so it drops out of
-        // `visible` while still being attached. Its last user space is retained so its
-        // workspaces are not treated as stranded and re-homed.
-        let retained: Vec<SpaceId> =
-            self.space_state.last_user_space_by_display.values().copied().collect();
-        self.layout_manager
-            .layout_engine
-            .virtual_workspace_manager_mut()
-            .apply_display_topology(&mut self.state.windows, &visible, &retained);
+        let relocated = self.layout_manager.layout_engine.apply_display_topology(
+            &mut self.state.windows,
+            &displays,
+            display_set_changed,
+        );
+        self.place_windows_on_their_screens(relocated, &mut outcome);
+        if !outcome.pre_layout_window_frame_writes.is_empty() {
+            outcome.absorb(EventOutcome::layout_changed(false).with_arrange_space_scope(None));
+        }
+        outcome
+    }
+
+    /// Writes each window onto the screen showing `space`. Writing the frame is what
+    /// actually makes macOS reparent the window; the arrange pass then lays it out
+    /// properly. Windows that arrive with a workspace whose display went away would
+    /// otherwise keep coordinates that are nowhere on screen.
+    fn place_windows_on_their_screens(
+        &mut self,
+        windows: impl IntoIterator<Item = (WindowId, SpaceId)>,
+        outcome: &mut EventOutcome,
+    ) {
+        for (window, space) in windows {
+            let Some(screen) = self.space_state.screen_by_space(space).map(|screen| screen.frame)
+            else {
+                continue;
+            };
+            let Some(state) = self.state.windows.window(window) else {
+                continue;
+            };
+            let window_server_id = state.info.sys_id;
+            let frame = Self::center_frame_on_screen(state.frame_monotonic, screen);
+            if let Some(window_state) = self.state.windows.window_mut(window) {
+                window_state.frame_monotonic = frame;
+            }
+            if let Some(window_server_id) = window_server_id {
+                self.state.windows.set_window_server_space(window_server_id, Some(space));
+                self.state.windows.mark_window_visible(window_server_id);
+            }
+            *outcome =
+                std::mem::take(outcome).with_pre_layout_window_frame_write(window, frame, true);
+        }
     }
 
     fn store_current_floating_positions(&mut self, space: SpaceId) {

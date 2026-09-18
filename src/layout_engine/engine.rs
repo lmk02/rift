@@ -1332,6 +1332,32 @@ impl LayoutEngine {
             workspace_id,
             new_space,
         );
+        self.rekey_workspace_stores(
+            window_store,
+            workspace_id,
+            old_space,
+            new_space,
+            new_screen_size,
+        );
+        self.virtual_workspace_manager.remember_home(
+            workspace_id,
+            self.space_display_map.get(&new_space).cloned().flatten(),
+        );
+
+        windows
+    }
+
+    /// Moves everything that keys on `SpaceId` for one workspace onto its new display.
+    /// Every ownership transfer has to go through here, or the workspace arrives without
+    /// its layout tree and its floating frames.
+    fn rekey_workspace_stores(
+        &mut self,
+        window_store: &WindowStore,
+        workspace_id: crate::model::VirtualWorkspaceId,
+        old_space: SpaceId,
+        new_space: SpaceId,
+        new_screen_size: CGSize,
+    ) {
         self.workspace_layouts.remap_workspace(workspace_id, old_space, new_space);
         self.floating_positions.remap_workspace(workspace_id, old_space, new_space);
 
@@ -1350,8 +1376,78 @@ impl LayoutEngine {
         self.broadcast_workspace_changed(new_space);
         self.broadcast_windows_changed(window_store, old_space);
         self.broadcast_windows_changed(window_store, new_space);
+    }
 
-        windows
+    /// Gives a display a workspace when it has none, carrying the layout stores with it.
+    /// Returns the windows that changed display, with the space they landed on.
+    pub fn backfill_display_workspace(
+        &mut self,
+        window_store: &mut WindowStore,
+        space: SpaceId,
+        screen_size: CGSize,
+        except: Option<crate::model::VirtualWorkspaceId>,
+    ) -> Vec<(WindowId, SpaceId)> {
+        let uuid = self.space_display_map.get(&space).cloned().flatten();
+        let Some(relocation) = self.virtual_workspace_manager.donate_workspace_to(
+            window_store,
+            space,
+            uuid.as_deref(),
+            except,
+        ) else {
+            return Vec::new();
+        };
+        self.rekey_workspace_stores(
+            window_store,
+            relocation.workspace,
+            relocation.old_space,
+            relocation.new_space,
+            screen_size,
+        );
+        relocation
+            .windows
+            .into_iter()
+            .map(|window| (window, relocation.new_space))
+            .collect()
+    }
+
+    /// Reconciles the shared workspace pool with the attached displays, carrying the
+    /// layout stores along with every workspace the pass moves.
+    ///
+    /// Returns the windows that changed display, with the display slot they landed on, so
+    /// the caller can place them on that screen.
+    pub fn apply_display_topology(
+        &mut self,
+        window_store: &mut WindowStore,
+        displays: &[crate::model::DisplaySlot],
+        display_set_changed: bool,
+    ) -> Vec<(WindowId, SpaceId)> {
+        let moves = self.virtual_workspace_manager.apply_display_topology(
+            window_store,
+            displays,
+            display_set_changed,
+        );
+        let mut relocated = Vec::new();
+        for relocation in moves {
+            let size = displays
+                .iter()
+                .find(|slot| slot.space == relocation.new_space)
+                .map(|slot| slot.size)
+                // A workspace re-homed off a display that is gone lands on a slot that is
+                // present; this is only reached if it does not, and the size is then
+                // corrected by the next `SpaceExposed`.
+                .unwrap_or_else(|| CGSize::new(0., 0.));
+            self.rekey_workspace_stores(
+                window_store,
+                relocation.workspace,
+                relocation.old_space,
+                relocation.new_space,
+                size,
+            );
+            relocated.extend(
+                relocation.windows.into_iter().map(|window| (window, relocation.new_space)),
+            );
+        }
+        relocated
     }
 
     pub fn prune_display_state(&mut self, active_display_uuids: &[String]) {

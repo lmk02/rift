@@ -268,6 +268,10 @@ drag_swap_fraction = 0.3
 #   is owned by one display at a time, and switching to a workspace owned by another display
 #   activates it there and moves focus to that display. next/prev workspace and
 #   move_window_to_workspace cross display boundaries the same way.
+#   The pool is never smaller than the number of attached displays, so every display always has
+#   a workspace to show. Unplugging a display moves its workspaces (and their windows and
+#   layouts) to a display that is still attached; plugging it back in returns them, including
+#   after a restart.
 enabled = true
 default_workspace_count = 4
 auto_assign_windows = true
@@ -288,10 +292,14 @@ workspace_rules = []
 #shared_across_displays = false
 
 # Which display owns which workspace, in shared_across_displays mode. Workspaces that are not
-# listed start on the first display. This is what makes a split like "1-5 left, 6-10 right"
-# survive a fresh install or a display being replugged.
+# listed start on the first display. This is what establishes a split like "1-5 left, 6-10 right"
+# on a fresh install or when a display is plugged in.
+# Applied when the set of attached displays changes, not on every space change, so moving a
+# workspace with move_workspace_to_display stays put until you replug something.
 # - workspace: global workspace index (0-based) or name
-# - display: display index in physical order, 0-based left to right, or a display UUID string
+# - display: display index in physical order, 0-based left to right, or a display UUID string.
+#   An index addresses whichever display is in that position *now*, so if you unplug displays
+#   regularly, name them by UUID instead.
 # workspace_display_assignment = [
 #   { workspace = 5, display = 1 },
 #   { workspace = 6, display = 1 },

@@ -13,7 +13,9 @@ pub use app_rules::{
 };
 pub use floating_position_store::FloatingPositionStore;
 pub use hidden_window_placement::{HiddenWindowPlacement, HideCorner};
-pub use virtual_workspace::{VirtualWorkspace, VirtualWorkspaceId, WorkspaceStore};
+pub use virtual_workspace::{
+    DisplaySlot, VirtualWorkspace, VirtualWorkspaceId, WorkspaceRelocation, WorkspaceStore,
+};
 pub use window_store::{
     PendingWindowOperation, WindowPlacement, WindowRecord, WindowStore, WindowVisibility,
     WindowWorkspaceInfo,
